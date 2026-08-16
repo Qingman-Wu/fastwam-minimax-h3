@@ -41,6 +41,7 @@ class Wan22Trainer:
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        self.save_final_checkpoint = bool(cfg.get("save_final_checkpoint", True))
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -48,6 +49,9 @@ class Wan22Trainer:
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
+        self.initial_step = int(cfg.get("initial_step", 0))
+        if self.initial_step < 0:
+            raise ValueError(f"`initial_step` must be non-negative, got {self.initial_step}.")
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
         if self.mixed_precision not in {"no", "fp16", "bf16"}:
             raise ValueError(
@@ -55,6 +59,7 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        self.swanlab_enabled = bool(cfg.get("swanlab", {}).get("enabled", False))
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -82,10 +87,11 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+        trainable_params = [
+            parameter
+            for module in self._trainable_modules(self.model)
+            for parameter in module.parameters()
+        ]
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -123,6 +129,8 @@ class Wan22Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
         self._init_wandb()
+        self.swanlab_run = None
+        self._init_swanlab()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
@@ -163,6 +171,36 @@ class Wan22Trainer:
             return
         self.wandb_run.finish()
         self.wandb_run = None
+
+    def _init_swanlab(self):
+        if not self.swanlab_enabled or not self.accelerator.is_main_process:
+            return
+        try:
+            import swanlab
+            from omegaconf import OmegaConf
+        except ImportError as e:
+            raise ImportError(
+                "SwanLab logging is enabled but `swanlab` is not installed."
+            ) from e
+        self.swanlab_run = swanlab.init(
+            project=str(self.cfg.swanlab.project),
+            name=str(self.cfg.swanlab.experiment_name),
+            config=OmegaConf.to_container(self.cfg, resolve=True),
+            mode=str(self.cfg.swanlab.mode),
+            log_dir=self.output_dir,
+        )
+        logger.info(
+            "Initialized SwanLab run: project=%s experiment=%s",
+            self.cfg.swanlab.project,
+            self.cfg.swanlab.experiment_name,
+        )
+
+    def _swanlab_log(self, payload: dict):
+        if self.swanlab_run is None:
+            return
+        import swanlab
+
+        swanlab.log(payload, step=self.global_step)
 
     def _build_loader(self, dataset, worker_init_fn=None):
         self.train_sampler = ResumableEpochSampler(
@@ -265,9 +303,15 @@ class Wan22Trainer:
     def _resume_or_load_checkpoint(self):
         resume = self.resume
         if not resume:
+            if self.initial_step:
+                raise ValueError("`initial_step` requires a weights-only `resume` checkpoint.")
             return
         resume_path = Path(str(resume))
         if resume_path.is_dir():
+            if self.initial_step:
+                raise ValueError(
+                    "`initial_step` must be zero when resuming a full training-state directory."
+                )
             logger.info("Resuming full training state from directory: %s", resume)
             self.load_training_state(str(resume_path))
             return
@@ -276,6 +320,18 @@ class Wan22Trainer:
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+        if self.initial_step:
+            self.global_step = self.initial_step
+            # The previous 2k run used a scheduler whose entire horizon was
+            # 2k, so restoring it would keep LR at eta_min. Rebuild the 100k
+            # scheduler and advance it to the matching global step instead.
+            for _ in range(self.initial_step):
+                self.scheduler.step()
+            logger.info(
+                "Initialized fresh optimizer/scheduler at global_step=%d lr=%.6g.",
+                self.global_step,
+                self.optimizer.param_groups[0]["lr"],
+            )
 
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
@@ -284,15 +340,26 @@ class Wan22Trainer:
         self._apply_dit_only_train_mode(model)
 
     @staticmethod
+    def _trainable_modules(model):
+        provider = getattr(model, "trainable_modules", None)
+        if callable(provider):
+            modules = list(provider())
+            if not modules:
+                raise ValueError("model.trainable_modules() returned no modules.")
+            return modules
+        modules = [model.dit]
+        proprio_encoder = getattr(model, "proprio_encoder", None)
+        if proprio_encoder is not None:
+            modules.append(proprio_encoder)
+        return modules
+
+    @staticmethod
     def _apply_dit_only_train_mode(model):
         model.eval()
         model.requires_grad_(False)
-        model.dit.train()
-        model.dit.requires_grad_(True)
-        proprio_encoder = getattr(model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            proprio_encoder.train()
-            proprio_encoder.requires_grad_(True)
+        for module in Wan22Trainer._trainable_modules(model):
+            module.train()
+            module.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -724,6 +791,7 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
+                        self._swanlab_log(wandb_payload)
 
                     if (
                         self.eval_every > 0
@@ -758,6 +826,7 @@ class Wan22Trainer:
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
+                            self._swanlab_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
@@ -770,22 +839,29 @@ class Wan22Trainer:
                             )
 
                     if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
-                        if self.accelerator.is_main_process:
+                        if self.save_final_checkpoint:
+                            ckpt_info = self.save_checkpoint()
+                            if self.accelerator.is_main_process:
+                                logger.info(
+                                    "[done] max_steps reached step=%d weights=%s state=%s",
+                                    self.global_step,
+                                    ckpt_info["weights_path"],
+                                    ckpt_info["state_path"],
+                                )
+                        elif self.accelerator.is_main_process:
                             logger.info(
-                                "[done] max_steps reached step=%d weights=%s state=%s",
+                                "[done] max_steps reached step=%d without final checkpoint",
                                 self.global_step,
-                                ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
                             )
                         return
 
-        ckpt_info = self.save_checkpoint()
-        if self.accelerator.is_main_process:
-            logger.info(
-                "[done] training finished step=%d weights=%s state=%s",
-                self.global_step,
-                ckpt_info["weights_path"],
-                ckpt_info["state_path"],
-            )
+        if self.save_final_checkpoint:
+            ckpt_info = self.save_checkpoint()
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "[done] training finished step=%d weights=%s state=%s",
+                    self.global_step,
+                    ckpt_info["weights_path"],
+                    ckpt_info["state_path"],
+                )
         

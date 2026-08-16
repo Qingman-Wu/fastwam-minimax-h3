@@ -158,6 +158,59 @@ def create_fastwam(
     )
 
 
+def create_fastwam_h3(
+    model_path: str,
+    video_dit_config,
+    action_dit_config,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    proprio_dim: int | None = None,
+    action_scheduler=None,
+    video_scheduler=None,
+    loss=None,
+    load_text_encoder: bool = False,
+    mot_checkpoint_mixed_attn: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """Build FastWAM with MiniMax-H3 as its visual world-model backbone."""
+    del load_text_encoder, mot_checkpoint_mixed_attn, video_scheduler
+    from .models.minimax_h3.fastwam import FastWAMH3
+
+    def as_dict(value, name: str):
+        if isinstance(value, DictConfig):
+            value = OmegaConf.to_container(value, resolve=True)
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError(f"`{name}` must resolve to a dict, got {type(value)}")
+        return value
+
+    video_dit_config = as_dict(video_dit_config, "video_dit_config")
+    action_dit_config = as_dict(action_dit_config, "action_dit_config")
+    action_scheduler = as_dict(action_scheduler, "action_scheduler")
+    loss = as_dict(loss, "loss")
+    required = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing = required - set(action_scheduler)
+    if missing:
+        raise ValueError(f"`action_scheduler` is missing {sorted(missing)}.")
+
+    return FastWAMH3.from_pretrained(
+        model_path=model_path,
+        video_dit_config=video_dit_config,
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        proprio_dim=None if proprio_dim is None else int(proprio_dim),
+        device=device,
+        torch_dtype=model_dtype,
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+    )
+
+
 def create_fastwam_joint(
     model_id: str,
     tokenizer_model_id: str,

@@ -1,0 +1,42 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam_h3
+  - _self_
+
+# Keep the original 32-step action horizon, but sample five visual frames.
+# H3 uses the 17k+5 frame family; five is the smallest valid uncond smoke-test
+# length and gives four transitions with eight actions per transition.
+data:
+  train:
+    action_video_freq_ratio: 8
+
+batch_size: 16
+num_workers: 16
+
+model:
+  # The optimized 8xH20 setting has enough memory to avoid recomputation.
+  mot_checkpoint_mixed_attn: false
+
+lr_scheduler_type: "cosine"
+learning_rate: 1.0e-4
+num_epochs: 10
+max_steps: 100000
+log_every: 10
+save_every: 10000
+# Action training is the experiment target; video rollout evaluation is not
+# meaningful while the public H3 backbone is intentionally frozen.
+eval_every: 0
+
+# 16 samples/GPU x 8 GPUs keeps the original effective global batch at 128.
+gradient_accumulation_steps: 1
+weight_decay: 1.0e-2
+resume: ./runs/libero_h3_uncond_2cam224_1e-4/experiment37_h3_libero_v2/checkpoints/weights/step_002000.pt
+initial_step: 2000
+
+swanlab:
+  enabled: true
+  project: fastwam-h3
+  experiment_name: experiment-37-libero
+  mode: online
