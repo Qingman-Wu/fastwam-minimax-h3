@@ -176,6 +176,37 @@ class H3ActionBlock(nn.Module):
         )
         return gate_per_row * update
 
+    def pre_attention(
+        self,
+        x: torch.Tensor,
+        time_embedding: torch.Tensor,
+        rope_freqs: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
+        modulation = self.modulation(time_embedding)
+        shift_msa, scale_msa, *_ = modulation
+        hidden = self.modulate_action_rows(
+            self.norm1(x), shift_msa, scale_msa, action_mask
+        )
+        q, k, v = self.attn.project_qkv(hidden, rope_freqs)
+        return q, k, v, modulation
+
+    def post_attention(
+        self,
+        x: torch.Tensor,
+        attention_output: torch.Tensor,
+        modulation: tuple[torch.Tensor, ...],
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        _, _, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
+        x = x + self.gate_action_rows(
+            self.attn.out_proj(attention_output.flatten(2)), gate_msa, action_mask
+        )
+        hidden = self.modulate_action_rows(
+            self.norm2(x), shift_mlp, scale_mlp, action_mask
+        )
+        return x + self.gate_action_rows(self.mlp(hidden), gate_mlp, action_mask)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -186,66 +217,20 @@ class H3ActionBlock(nn.Module):
     ) -> torch.Tensor:
         if action_mask is None:
             action_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation(time_embedding)
+        q, k, v, modulation = self.pre_attention(
+            x, time_embedding, rope_freqs, action_mask
         )
-        h = self.norm1(x)
-        h = self.modulate_action_rows(h, shift_msa, scale_msa, action_mask)
-        x = x + self.gate_action_rows(
-            self.attn(h, rope_freqs, attention_mask), gate_msa, action_mask
-        )
-        h = self.norm2(x)
-        h = self.modulate_action_rows(h, shift_mlp, scale_mlp, action_mask)
-        return x + self.gate_action_rows(self.mlp(h), gate_mlp, action_mask)
-
-    def forward_mixed(
-        self,
-        x: torch.Tensor,
-        time_embedding: torch.Tensor,
-        rope_freqs: torch.Tensor,
-        video_k: torch.Tensor,
-        video_v: torch.Tensor,
-        context_tokens: torch.Tensor,
-        context_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Action queries attend to frozen H3 visual K/V, language, and actions."""
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation(time_embedding)
-        )
-        hidden = self.norm1(x)
-        hidden = hidden * (1 + scale_msa[:, None]) + shift_msa[:, None]
-        q, action_k, action_v = self.attn.project_qkv(hidden, rope_freqs)
-        context_k, context_v = self.attn.project_kv(context_tokens)
-        keys = torch.cat((video_k, context_k, action_k), dim=1)
-        values = torch.cat((video_v, context_v, action_v), dim=1)
-
-        batch, action_len = x.shape[:2]
-        prefix_len = video_k.shape[1]
-        action_valid = torch.ones(
-            (batch, action_len), dtype=torch.bool, device=x.device
-        )
-        video_valid = torch.ones(
-            (batch, prefix_len), dtype=torch.bool, device=x.device
-        )
-        key_valid = torch.cat(
-            (video_valid, context_mask.to(torch.bool), action_valid), dim=1
-        )
-        attention_mask = key_valid[:, None, None, :].expand(
-            -1, 1, action_len, -1
-        )
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device=x.device, dtype=torch.bool)
+            if attention_mask.ndim == 2:
+                attention_mask = attention_mask[None, None]
         attended = F.scaled_dot_product_attention(
             q.transpose(1, 2),
-            keys.transpose(1, 2),
-            values.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
             attn_mask=attention_mask,
-        )
-        attended = attended.transpose(1, 2).reshape(
-            batch, action_len, self.attn.inner_dim
-        )
-        x = x + gate_msa[:, None] * self.attn.out_proj(attended)
-        hidden = self.norm2(x)
-        hidden = hidden * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        return x + gate_mlp[:, None] * self.mlp(hidden)
+        ).transpose(1, 2)
+        return self.post_attention(x, attended, modulation, action_mask)
 
 
 @dataclass(frozen=True)

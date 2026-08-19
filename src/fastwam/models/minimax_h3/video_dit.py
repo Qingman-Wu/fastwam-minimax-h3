@@ -22,9 +22,21 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """Apply H3's partial 3D RoPE to [B, S, heads, head_dim]."""
     rot_dim = int(freqs.shape[-1])
+    if rot_dim > x.shape[-1]:
+        raise ValueError(
+            f"RoPE rotates {rot_dim} dimensions but attention head has {x.shape[-1]}"
+        )
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    cos = freqs.cos().to(dtype=x.dtype)[None, :, None, :]
-    sin = freqs.sin().to(dtype=x.dtype)[None, :, None, :]
+    if freqs.ndim == 2:
+        cos = freqs.cos().to(dtype=x.dtype)[None, :, None, :]
+        sin = freqs.sin().to(dtype=x.dtype)[None, :, None, :]
+    elif freqs.ndim == 3 and freqs.shape[:2] == x.shape[:2]:
+        cos = freqs.cos().to(dtype=x.dtype)[:, :, None, :]
+        sin = freqs.sin().to(dtype=x.dtype)[:, :, None, :]
+    else:
+        raise ValueError(
+            f"freqs must be [S,R] or [B,S,R], got {tuple(freqs.shape)}"
+        )
     return torch.cat((x_rot * cos + _rotate_half(x_rot) * sin, x_pass), dim=-1)
 
 
@@ -207,11 +219,29 @@ class H3AdaLNProjection(nn.Module):
         self.hidden_size = int(hidden_size)
         self.linear = nn.Linear(time_embed_dim, hidden_size * 6 * 3, bias=True)
 
-    def video(self, time_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        batch = time_embedding.shape[0]
+    def forward(self, time_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
         values = self.linear(F.silu(time_embedding))
-        values = values.view(batch, 3, 6, self.hidden_size)[:, 0]
+        values = values.view(time_embedding.shape[0] * 3, 6, self.hidden_size)
         return values.unbind(dim=1)
+
+    def select(
+        self,
+        time_embedding: torch.Tensor,
+        combined_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        values = self(time_embedding)
+        flat_indices = combined_indices.reshape(-1).to(dtype=torch.long)
+        return tuple(
+            value.index_select(0, flat_indices).view(*combined_indices.shape, -1)
+            for value in values
+        )
+
+    def video(self, time_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        values = self(time_embedding)
+        video_indices = torch.arange(
+            time_embedding.shape[0], device=time_embedding.device, dtype=torch.long
+        ) * 3
+        return tuple(value.index_select(0, video_indices) for value in values)
 
 
 class H3VideoBlock(nn.Module):
@@ -233,39 +263,29 @@ class H3VideoBlock(nn.Module):
         )
         self.mlp = H3MLP(hidden_size, ffn_hidden_size)
         self.adaln_proj = H3AdaLNProjection(hidden_size, time_embed_dim)
-        self.register_buffer(
-            "cached_video_modulation", None, persistent=False
-        )
-
-    @torch.no_grad()
-    def cache_zero_timestep_adaln(self, time_embedding: torch.Tensor) -> None:
-        if self.adaln_proj is None:
-            return
-        values = self.adaln_proj.video(time_embedding)
-        self.cached_video_modulation = torch.stack(
-            [value[0].detach().contiguous() for value in values], dim=0
-        )
-        # H3 documents that its ~13B AdaLN branch can be precomputed and
-        # omitted for inference-only deployment. FastWAM always prefills the
-        # frozen visual branch at t=0, so keeping these weights wastes 26GB.
-        self.adaln_proj = None
-
     def pre_attention(
         self,
         x: torch.Tensor,
         time_embedding: torch.Tensor,
         rope_freqs: torch.Tensor,
+        combined_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
-        if self.cached_video_modulation is None:
-            modulation = self.adaln_proj.video(time_embedding)
-        else:
+        if combined_indices is None:
+            if time_embedding.shape[0] != x.shape[0]:
+                raise ValueError(
+                    "batch-aligned H3 modulation requires one timestep per sample"
+                )
             modulation = tuple(
-                value.unsqueeze(0).expand(time_embedding.shape[0], -1)
-                for value in self.cached_video_modulation
+                value[:, None].expand(-1, x.shape[1], -1)
+                for value in self.adaln_proj.video(time_embedding)
             )
+        else:
+            if combined_indices.shape != x.shape[:2]:
+                raise ValueError("combined_indices must match H3 [B,S] rows")
+            modulation = self.adaln_proj.select(time_embedding, combined_indices)
         shift_msa, scale_msa, *_ = modulation
         hidden = self.norm1(x)
-        hidden = hidden * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        hidden = hidden * (1 + scale_msa) + shift_msa
         q, k, v = self.attn.project_qkv(hidden, rope_freqs)
         return q, k, v, modulation
 
@@ -276,10 +296,10 @@ class H3VideoBlock(nn.Module):
         modulation: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
         _, _, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
-        x = x + gate_msa[:, None] * self.attn.output(attention_output)
+        x = x + gate_msa * self.attn.output(attention_output)
         hidden = self.norm2(x)
-        hidden = hidden * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        return x + gate_mlp[:, None] * self.mlp(hidden)
+        hidden = hidden * (1 + scale_mlp) + shift_mlp
+        return x + gate_mlp * self.mlp(hidden)
 
 
 class H3FinalLayer(nn.Module):
@@ -514,15 +534,6 @@ class MiniMaxH3VideoBackbone(nn.Module):
             "meta": meta,
         }
 
-    @torch.no_grad()
-    def cache_zero_timestep_adaln(self) -> None:
-        parameter = next(self.parameters())
-        timestep = torch.zeros((1,), device=parameter.device, dtype=parameter.dtype)
-        embedding = self.time_embedder(timestep, parameter.dtype)
-        for block in self.blocks:
-            block.cache_zero_timestep_adaln(embedding)
-
-
 def load_h3_video_backbone(
     transformer_dir: str | Path,
     *,
@@ -570,5 +581,4 @@ def load_h3_video_backbone(
     missing = target_keys - loaded
     if missing:
         raise RuntimeError(f"Did not load all H3 visual parameters: {sorted(missing)[:10]}")
-    model.cache_zero_timestep_adaln()
     return model.to(device=device, dtype=dtype).eval()

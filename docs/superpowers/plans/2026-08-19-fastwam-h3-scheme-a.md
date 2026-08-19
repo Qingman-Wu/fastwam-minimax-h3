@@ -206,7 +206,7 @@
 - Produces: asymmetric_joint_attention(h3_qkv, action_qkv, regions), H3/Action aligned block runner.
 - Consumes: H3 rows and state/action rows with explicit region boundaries.
 
-- [ ] **Step 1: Write failing visibility tests**
+- [x] **Step 1: Write failing visibility tests**
 
     def test_action_changes_cannot_change_h3_output(tiny_joint_layer):
         h3 = torch.randn(1, 6, 8)
@@ -225,23 +225,23 @@
         _, changed = tiny_joint_layer(h3 + 1, state + 1, action)
         assert not torch.allclose(baseline, changed)
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_mixed_attention.py -q
 
-- [ ] **Step 3: Implement three query visibility paths**
+- [x] **Step 3: Implement three query visibility paths**
 
   H3 query attends only H3 keys. State query attends Qwen/keyframe plus itself.
   Action query attends Qwen/keyframe/noisy-video/state/action keys. Masks are
   derived from explicit indices and support a per-sample valid-length mask.
 
-- [ ] **Step 4: Run aligned H3/Action blocks without a video KV cache**
+- [x] **Step 4: Run aligned H3/Action blocks without a video KV cache**
 
   Each H3 block computes its own native attention and update. The aligned Action
   block then reads that layer's H3 K/V and updates the state/action stream. H3
   does not read Action K/V. The forward returns both final H3 and action states.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_mixed_attention.py -q
     git add src/fastwam/models/minimax_h3/mixed_attention.py src/fastwam/models/minimax_h3/video_dit.py src/fastwam/models/minimax_h3/action_dit.py tests/models/minimax_h3/test_mixed_attention.py
