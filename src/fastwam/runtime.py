@@ -167,6 +167,7 @@ def create_fastwam_h3(
     video_scheduler=None,
     loss=None,
     load_text_encoder: bool = True,
+    text_encoder_device: str | None = None,
     mot_checkpoint_mixed_attn: bool = True,
     keyframe_condition_strength: float = 0.999,
     video_fps: float = 24.0,
@@ -238,6 +239,9 @@ def create_fastwam_h3(
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
         load_text_encoder=bool(load_text_encoder),
+        text_encoder_device=(
+            device if text_encoder_device is None else str(text_encoder_device)
+        ),
         device=device,
         torch_dtype=model_dtype,
         video_train_shift=float(video_scheduler["train_shift"]),

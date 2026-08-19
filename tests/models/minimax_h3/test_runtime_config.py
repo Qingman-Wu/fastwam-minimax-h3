@@ -41,6 +41,7 @@ def minimal_kwargs():
         },
         "loss": {"lambda_video": 1.0, "lambda_action": 1.0},
         "load_text_encoder": True,
+        "text_encoder_device": "cuda:3",
         "keyframe_condition_strength": 0.999,
         "video_fps": 24.0,
         "action_fps": 8.0,
@@ -65,6 +66,7 @@ def test_runtime_wires_both_schedulers_state_and_native_text(monkeypatch):
 
     assert create_fastwam_h3(**minimal_kwargs()) is sentinel
     assert captured["load_text_encoder"] is True
+    assert captured["text_encoder_device"] == "cuda:3"
     assert captured["video_train_shift"] == 12.0
     assert captured["action_train_shift"] == 5.0
     assert captured["keyframe_condition_strength"] == 0.999

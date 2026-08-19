@@ -119,7 +119,9 @@ Training sets `model.load_text_encoder=false` and reads the cache named by the
 post-transform f0 pixels plus instruction. Variable Qwen row counts are padded
 only by the batch collator; `prompt_attention_mask` marks those structural rows
 invalid. Online inference may either load the Qwen encoder or point
-`inference.h3_condition_cache_dir` at a matching cache.
+`inference.h3_condition_cache_dir` at a matching cache. Live uncached inference
+sets `model.text_encoder_device` to a separate GPU; the layer-50 rows are then
+copied to the Video Expert device before packed attention.
 
 ## Inference contract
 

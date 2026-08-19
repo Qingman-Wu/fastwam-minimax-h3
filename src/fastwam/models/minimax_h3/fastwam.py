@@ -107,6 +107,7 @@ class FastWAMH3(nn.Module):
         action_dit_pretrained_path: str | Path | None,
         skip_dit_load_from_pretrain: bool,
         load_text_encoder: bool,
+        text_encoder_device: str | torch.device,
         device: str | torch.device,
         torch_dtype: torch.dtype,
         video_train_shift: float,
@@ -143,7 +144,7 @@ class FastWAMH3(nn.Module):
         )
         text_conditioner = (
             MiniMaxH3TextConditioner.from_pretrained(
-                model_path, device=device, dtype=torch_dtype
+                model_path, device=text_encoder_device, dtype=torch_dtype
             )
             if load_text_encoder
             else None
@@ -292,7 +293,12 @@ class FastWAMH3(nn.Module):
         batch = self.text_conditioner.encode(
             self._tensor_images_to_pil(first_frame), list(instructions)
         )
-        return self._dense_text_batch(batch)
+        embeddings, tags, valid = self._dense_text_batch(batch)
+        return (
+            embeddings.to(device=self.device, dtype=self.torch_dtype),
+            tags.to(device=self.device, dtype=torch.long),
+            valid.to(device=self.device, dtype=torch.bool),
+        )
 
     def _prepare_state(self, sample: dict[str, Any], batch_size: int) -> torch.Tensor:
         proprio = sample.get("proprio")

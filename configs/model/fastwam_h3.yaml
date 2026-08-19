@@ -1,6 +1,9 @@
 _target_: fastwam.runtime.create_fastwam_h3
 model_path: /root/wuqingman/models/MiniMax-H3/FL2VA
 load_text_encoder: true
+# For live inference, place Qwen on a different >=64GB GPU from the H3 Video
+# Expert. Scheme-A training overrides load_text_encoder=false and uses cache.
+text_encoder_device: null
 proprio_dim: ${data.train.processor.proprio_output_dim}
 mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/H3ActionDiT_video_interp_1024hdim.pt
