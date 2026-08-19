@@ -140,6 +140,16 @@ def test_action_loss_excludes_padded_times_and_dimensions():
     assert metrics["loss_action"] == changed_metrics["loss_action"]
 
 
+def test_action_padding_is_removed_from_action_expert_inputs():
+    model = make_model()
+
+    deterministic_training_loss(model, make_sample())
+
+    noisy_action = model.video_expert.last_inputs["noisy_action_tokens"]
+    assert torch.equal(noisy_action[:, :, 1], torch.zeros(1, 4))
+    assert torch.equal(noisy_action[:, 2:], torch.zeros(1, 2, 3))
+
+
 def test_state_is_current_aligned_condition_and_invalid_dimensions_are_zero():
     model = make_model()
 

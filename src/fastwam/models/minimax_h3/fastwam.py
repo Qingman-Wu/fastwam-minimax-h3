@@ -453,6 +453,10 @@ class FastWAMH3(nn.Module):
             device=self.device,
         )
         action_valid = ~action_is_pad
+        action_input_valid = (
+            action_valid.unsqueeze(-1) & ~action_dim_is_pad.unsqueeze(1)
+        )
+        noisy_action = noisy_action.masked_fill(~action_input_valid, 0.0)
 
         predictions = self.video_expert.forward_joint(
             action_expert=self.action_expert,
@@ -490,9 +494,7 @@ class FastWAMH3(nn.Module):
         action_element_loss = F.mse_loss(
             action_prediction.float(), action_target.float(), reduction="none"
         )
-        action_element_valid = (
-            action_valid.unsqueeze(-1) & ~action_dim_is_pad.unsqueeze(1)
-        )
+        action_element_valid = action_input_valid
         action_per_sample = (
             (action_element_loss * action_element_valid).flatten(1).sum(dim=1)
             / action_element_valid.flatten(1).sum(dim=1).clamp(min=1)
