@@ -598,12 +598,17 @@ class FastWAMH3(nn.Module):
         batch_size, _, height, width = input_image.shape
         num_frames = int(num_frames)
         action_horizon = int(action_horizon)
+        num_inference_steps = int(num_inference_steps)
         if num_frames < 5 or num_frames % 17 != 5:
             raise ValueError(f"H3 num_frames must be 5+17k, got {num_frames}")
         if height % 32 or width % 32:
             raise ValueError("H3 input height and width must be divisible by 32")
         if action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
+        if num_inference_steps < 2:
+            raise ValueError(
+                "H3 num_inference_steps counts sigma points and must be at least 2"
+            )
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         if proprio.ndim == 1:
@@ -701,7 +706,7 @@ class FastWAMH3(nn.Module):
 
         video_timesteps, video_deltas = (
             self.infer_video_scheduler.build_inference_schedule(
-                num_inference_steps,
+                num_inference_steps - 1,
                 self.device,
                 latents_video.dtype,
                 shift_override=sigma_shift,
@@ -709,7 +714,7 @@ class FastWAMH3(nn.Module):
         )
         action_timesteps, action_deltas = (
             self.infer_action_scheduler.build_inference_schedule(
-                num_inference_steps,
+                num_inference_steps - 1,
                 self.device,
                 latents_action.dtype,
                 shift_override=action_sigma_shift,

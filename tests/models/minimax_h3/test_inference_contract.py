@@ -135,7 +135,8 @@ def test_joint_inference_updates_full_video_and_action_at_every_step():
 
     output = model.infer(**infer_kwargs())
 
-    assert len(model.video_expert.calls) == 3
+    # H3 interprets num_inference_steps as sigma-grid points, including zero.
+    assert len(model.video_expert.calls) == 2
     assert not torch.equal(
         model.video_expert.calls[0]["video"], model.video_expert.calls[1]["video"]
     )
@@ -206,4 +207,13 @@ def test_inference_rejects_ground_truth_action_conditioning():
     kwargs["action"] = torch.zeros(4, 3)
 
     with pytest.raises(ValueError, match="ground-truth action"):
+        model.infer(**kwargs)
+
+
+def test_inference_requires_two_or_more_h3_sigma_points():
+    model = make_model()
+    kwargs = infer_kwargs()
+    kwargs["num_inference_steps"] = 1
+
+    with pytest.raises(ValueError, match="sigma points"):
         model.infer(**kwargs)
