@@ -95,7 +95,7 @@
 - Produces: MiniMaxH3TextConditioner.encode(images, instructions), augment_keyframe_latents(), MiniMaxH3VideoBackbone.embed_h3_stream().
 - Consumes: H3 processor/text_encoder directories, Qwen input tensors, H3 condition_proj and TokenRefiner weights, VAE image encoding.
 
-- [ ] **Step 1: Write failing condition tests**
+- [x] **Step 1: Write failing condition tests**
 
     def test_keyframe_augmentation_uses_h3_native_ratio():
         clean = torch.full((1, 24, 1, 2, 2), 2.0)
@@ -112,29 +112,29 @@
         assert embedded.shape == (3, tiny_video_dit.hidden_size)
         assert torch.equal(tags, torch.tensor([1, 0, 1]))
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_conditioning.py -q
 
-- [ ] **Step 3: Add Qwen3-VL wrapper with lazy imports**
+- [x] **Step 3: Add Qwen3-VL wrapper with lazy imports**
 
   The wrapper loads AutoProcessor and the H3 Qwen3-VL model only when requested,
   builds an FL2VA first-frame presentation, returns flattened hidden states and
   literal tags 0/1, and supports precomputed prompt_embeds/tags for training.
   It rejects context tensors with the old 4096-wide Wan contract.
 
-- [ ] **Step 4: Restore H3 condition projection and two-layer TokenRefiner**
+- [x] **Step 4: Restore H3 condition projection and two-layer TokenRefiner**
 
   MiniMaxH3VideoBackbone gains condition_proj and token_refiner modules whose
   checkpoint names and shapes match released H3 weights. Audio projection/head
   remain absent from the instantiated model and are omitted by the loader.
 
-- [ ] **Step 5: Make image encoding use the native process_image route**
+- [x] **Step 5: Make image encoding use the native process_image route**
 
   MiniMaxH3VAEAdapter.encode_image calls encode_video(..., process_image=True)
   when the released wrapper exposes it, and validates one temporal latent.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_conditioning.py -q
     git add src/fastwam/models/minimax_h3/text_encoder.py src/fastwam/models/minimax_h3/video_vae.py src/fastwam/models/minimax_h3/video_dit.py tests/models/minimax_h3/test_conditioning.py

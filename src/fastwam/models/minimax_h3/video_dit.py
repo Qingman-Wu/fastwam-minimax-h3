@@ -1,10 +1,4 @@
-"""MiniMax-H3 video backbone primitives used by FastWAM.
-
-The module follows the public MiniMax-H3 FL2VA checkpoint layout, but exposes
-the per-layer video K/V states needed by FastWAM's action expert.  Audio and
-text packing stay outside this class: FastWAM uses H3 as a visual world-model
-backbone and keeps task language on the action branch.
-"""
+"""MiniMax-H3 packed video/text backbone primitives used by FastWAM."""
 
 from __future__ import annotations
 
@@ -99,19 +93,33 @@ class H3Attention(nn.Module):
         self.out_proj = nn.Linear(self.inner_dim, hidden_size, bias=False)
 
     def project_qkv(
-        self, x: torch.Tensor, rope_freqs: torch.Tensor
+        self, x: torch.Tensor, rope_freqs: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len, _ = x.shape
         qkv = self.qkv_proj(x).view(
             batch, seq_len, self.num_heads, 3, self.head_dim
         )
-        q = apply_rope(self.q_norm(qkv[:, :, :, 0]), rope_freqs)
-        k = apply_rope(self.k_norm(qkv[:, :, :, 1]), rope_freqs)
+        q = self.q_norm(qkv[:, :, :, 0])
+        k = self.k_norm(qkv[:, :, :, 1])
         v = qkv[:, :, :, 2]
+        if rope_freqs is not None:
+            q = apply_rope(q, rope_freqs)
+            k = apply_rope(k, rope_freqs)
         return q, k, v
 
     def output(self, attention_output: torch.Tensor) -> torch.Tensor:
         return self.out_proj(attention_output.flatten(2))
+
+    def forward(
+        self, x: torch.Tensor, rope_freqs: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        q, k, v = self.project_qkv(x, rope_freqs)
+        attended = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+        ).transpose(1, 2)
+        return self.output(attended)
 
 
 class H3MLP(nn.Module):
@@ -123,6 +131,72 @@ class H3MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.fc1(x).chunk(2, dim=-1)
         return self.fc2(F.silu(gate) * up)
+
+
+class H3TokenRefinerBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        ffn_hidden_size: int,
+        norm_eps: float,
+        qk_norm_eps: float,
+    ) -> None:
+        super().__init__()
+        self.norm1 = H3RMSNorm(hidden_size, norm_eps)
+        self.norm2 = H3RMSNorm(hidden_size, norm_eps)
+        self.attn = H3Attention(
+            hidden_size, num_attention_heads, attention_head_dim, qk_norm_eps
+        )
+        self.mlp = H3MLP(hidden_size, ffn_hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), rope_freqs=None)
+        return x + self.mlp(self.norm2(x))
+
+
+class H3TokenRefiner(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        ffn_hidden_size: int,
+        norm_eps: float,
+        qk_norm_eps: float,
+        final_norm_eps: float,
+    ) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [
+                H3TokenRefinerBlock(
+                    hidden_size,
+                    num_attention_heads,
+                    attention_head_dim,
+                    ffn_hidden_size,
+                    norm_eps,
+                    qk_norm_eps,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = H3RMSNorm(hidden_size, final_norm_eps)
+
+    def forward(
+        self, x: torch.Tensor, cu_seqlens: torch.Tensor
+    ) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(f"TokenRefiner input must be [S,H], got {tuple(x.shape)}")
+        bounds = [int(value) for value in cu_seqlens.tolist()]
+        hidden = x
+        for block in self.blocks:
+            hidden = torch.cat(
+                [block(hidden[start:end].unsqueeze(0)).squeeze(0) for start, end in zip(bounds[:-1], bounds[1:])],
+                dim=0,
+            )
+        return self.final_norm(hidden)
 
 
 class H3AdaLNProjection(nn.Module):
@@ -245,6 +319,8 @@ class MiniMaxH3VideoBackbone(nn.Module):
         attention_head_dim: int = 128,
         latents_dim: int = 24,
         patch_size: tuple[int, int, int] = (1, 2, 2),
+        text_dim: int = 5120,
+        token_refiner_num_layers: int = 2,
         timestep_input_dim: int = 256,
         time_embed_hidden_size: int = 5376,
         time_embed_dim: int = 2688,
@@ -263,10 +339,22 @@ class MiniMaxH3VideoBackbone(nn.Module):
         self.attention_head_dim = int(attention_head_dim)
         self.attn_head_dim = self.attention_head_dim
         self.latents_dim = int(latents_dim)
+        self.text_dim = int(text_dim)
         self.patch_size = tuple(int(v) for v in patch_size)
         self.video_attention_mask_mode = str(video_attention_mask_mode)
         patch_dim = self.latents_dim * math.prod(self.patch_size)
         self.video_patch_proj = nn.Linear(patch_dim, hidden_size, bias=True)
+        self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
+        self.token_refiner = H3TokenRefiner(
+            token_refiner_num_layers,
+            hidden_size,
+            num_attention_heads,
+            attention_head_dim,
+            ffn_hidden_size,
+            norm_eps,
+            qk_norm_eps,
+            final_norm_eps,
+        )
         self.time_embedder = H3TimeEmbedder(
             timestep_input_dim, time_embed_hidden_size, time_embed_dim
         )
@@ -292,6 +380,35 @@ class MiniMaxH3VideoBackbone(nn.Module):
             self.patch_size,
             final_norm_eps,
         )
+
+    def refine_text_condition(
+        self,
+        qwen_embeddings: torch.Tensor,
+        token_tags: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project native Qwen width and run H3's two-layer TokenRefiner."""
+
+        if qwen_embeddings.ndim != 2 or qwen_embeddings.shape[-1] != self.text_dim:
+            raise ValueError(
+                f"qwen_embeddings must be [S,{self.text_dim}], got "
+                f"{tuple(qwen_embeddings.shape)}"
+            )
+        if token_tags.shape != qwen_embeddings.shape[:1]:
+            raise ValueError("token_tags must match the flattened Qwen sequence")
+        tags = token_tags.to(device=qwen_embeddings.device, dtype=torch.long)
+        if not torch.logical_or(tags == 0, tags == 1).all():
+            raise ValueError("Qwen tags must contain only video 0 or text 1")
+        cu_seqlens = cu_seqlens.to(device=qwen_embeddings.device, dtype=torch.int32)
+        if (
+            cu_seqlens.ndim != 1
+            or cu_seqlens.numel() < 2
+            or int(cu_seqlens[0]) != 0
+            or int(cu_seqlens[-1]) != qwen_embeddings.shape[0]
+            or not (cu_seqlens[1:] > cu_seqlens[:-1]).all()
+        ):
+            raise ValueError("cu_seqlens must delimit every non-empty Qwen sample")
+        return self.token_refiner(self.condition_proj(qwen_embeddings), cu_seqlens)
 
     def patchify(self, latents: torch.Tensor) -> tuple[torch.Tensor, dict[str, int]]:
         batch, channels, frames, height, width = latents.shape
