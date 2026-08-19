@@ -153,6 +153,19 @@ class MiniMaxH3TextConditioner(nn.Module):
             trust_remote_code=True,
         )
         model = causal_model.model
+        language_layers = model.language_model.layers
+        if len(language_layers) < H3_QWEN_HIDDEN_LAYER:
+            raise ValueError(
+                f"H3 Qwen checkpoint has only {len(language_layers)} language "
+                f"layers; layer {H3_QWEN_HIDDEN_LAYER} is required"
+            )
+        if len(language_layers) > H3_QWEN_HIDDEN_LAYER:
+            # H3 consumes the output after language layer 49. Layers 50+ can
+            # be released immediately, which materially reduces the offline
+            # cache job's resident memory without changing its output.
+            model.language_model.layers = nn.ModuleList(
+                list(language_layers[:H3_QWEN_HIDDEN_LAYER])
+            )
         del causal_model
         return cls(processor=processor, model=model.to(device), device=device, dtype=dtype)
 

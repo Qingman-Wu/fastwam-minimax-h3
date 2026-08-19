@@ -105,6 +105,22 @@ Both losses are normalized by their own valid-element counts before weighting:
 
     loss = lambda_video * loss_video + lambda_action * loss_action
 
+## Native Qwen condition cache
+
+The H3 Video Expert and Qwen3-VL-32B are not kept on the same training GPU.
+Before training, run the exact first-frame plus instruction encoder once and
+cache its unnormalized layer-50 rows and modality tags:
+
+    torchrun --standalone --nproc_per_node=8 \
+      scripts/precompute_h3_conditions.py \
+      task=libero_h3_uncond_2cam224_1e-4 overwrite=false
+
+Training sets `model.load_text_encoder=false` and reads the cache named by the
+post-transform f0 pixels plus instruction. Variable Qwen row counts are padded
+only by the batch collator; `prompt_attention_mask` marks those structural rows
+invalid. Online inference may either load the Qwen encoder or point
+`inference.h3_condition_cache_dir` at a matching cache.
+
 ## Inference contract
 
 Inference receives f0, instruction, state, random video noise, and random action

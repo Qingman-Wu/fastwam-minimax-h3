@@ -6,7 +6,7 @@ import torch
 from omegaconf import OmegaConf
 
 from fastwam.models.minimax_h3.fastwam import FastWAMH3
-from fastwam.runtime import create_fastwam_h3
+from fastwam.runtime import _prepare_h3_inference_state, create_fastwam_h3
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -116,8 +116,10 @@ def test_h3_task_uses_native_prompt_path_and_no_t5_cache():
     data_config = OmegaConf.load(ROOT / "configs/data/libero_2cam.yaml")
 
     assert config.data.train.text_embedding_cache_dir is None
+    assert config.data.train.h3_condition_cache_dir is not None
     assert config.data.train.max_padding_retry == 50
     assert config.model.action_fps == 192.0
+    assert config.model.load_text_encoder is False
     assert data_config.train.num_frames == 33
     assert config.data.train.action_video_freq_ratio == 8
 
@@ -127,3 +129,28 @@ def test_transformers_pin_exposes_qwen3_vl_release():
 
     dependencies = pyproject["project"]["dependencies"]
     assert "transformers==4.57.6" in dependencies
+
+
+def test_h3_cli_inference_prepares_required_state_and_action_horizon():
+    inference = OmegaConf.create(
+        {
+            "action_horizon": 32,
+            "proprio": [0.1, 0.2, 0.3, 0.4],
+            "proprio_dim_is_pad": [False, False, True, False],
+        }
+    )
+
+    prepared = _prepare_h3_inference_state(inference, expected_state_dim=4)
+
+    assert prepared["action_horizon"] == 32
+    assert torch.allclose(
+        prepared["proprio"], torch.tensor([0.1, 0.2, 0.3, 0.4])
+    )
+    assert prepared["proprio_dim_is_pad"].tolist() == [False, False, True, False]
+
+
+def test_h3_cli_inference_rejects_missing_state():
+    inference = OmegaConf.create({"action_horizon": 32})
+
+    with pytest.raises(ValueError, match="proprio"):
+        _prepare_h3_inference_state(inference, expected_state_dim=4)

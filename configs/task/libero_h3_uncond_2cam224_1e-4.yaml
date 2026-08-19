@@ -14,6 +14,7 @@ data:
     # H3 Qwen3-VL consumes f0 and instruction together; Wan/T5 text-only
     # embeddings are not compatible with this conditioning path.
     text_embedding_cache_dir: null
+    h3_condition_cache_dir: ./data/h3_condition_cache/libero_2cam224
     skip_padding_as_possible: true
     max_padding_retry: 50
 
@@ -21,6 +22,9 @@ batch_size: 16
 num_workers: 16
 
 model:
+  # Training reads exact Qwen layer-50 f0+instruction rows from the native
+  # cache so the 32B encoder and H3 Video Expert never share one GPU.
+  load_text_encoder: false
   # The optimized 8xH20 setting has enough memory to avoid recomputation.
   mot_checkpoint_mixed_attn: false
   # The 32 action rows cover the four transitions of five visual frames.

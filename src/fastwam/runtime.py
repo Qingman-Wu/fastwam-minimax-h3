@@ -482,6 +482,67 @@ def run_training(cfg: DictConfig):
     )
     trainer.train()
 
+
+def _prepare_h3_inference_state(
+    inference_cfg: DictConfig,
+    *,
+    expected_state_dim: int,
+) -> dict[str, torch.Tensor | int]:
+    """Load the normalized f0 state required by H3 action inference."""
+
+    action_horizon = inference_cfg.get("action_horizon")
+    if action_horizon is None or int(action_horizon) <= 0:
+        raise ValueError("H3 inference requires a positive `action_horizon`")
+    inline_state = inference_cfg.get("proprio")
+    state_path = inference_cfg.get("proprio_path")
+    if inline_state is not None and state_path is not None:
+        raise ValueError("Set only one of `proprio` and `proprio_path`")
+    if inline_state is None and state_path is None:
+        raise ValueError(
+            "H3 inference requires normalized f0 state via `proprio` or "
+            "`proprio_path`"
+        )
+    if state_path is not None:
+        path = Path(str(state_path))
+        if not path.is_file():
+            raise FileNotFoundError(f"H3 proprio_path does not exist: {path}")
+        if path.suffix.lower() == ".npy":
+            value = torch.from_numpy(np.load(path))
+        else:
+            value = torch.load(path, map_location="cpu", weights_only=True)
+            if isinstance(value, dict):
+                if "proprio" not in value:
+                    raise ValueError(
+                        "H3 proprio checkpoint dict must contain a `proprio` tensor"
+                    )
+                value = value["proprio"]
+    else:
+        value = OmegaConf.to_container(inline_state, resolve=True)
+    proprio = torch.as_tensor(value, dtype=torch.float32).reshape(-1)
+    expected_state_dim = int(expected_state_dim)
+    if proprio.numel() != expected_state_dim:
+        raise ValueError(
+            f"H3 proprio must contain {expected_state_dim} values, got "
+            f"{proprio.numel()}"
+        )
+
+    prepared: dict[str, torch.Tensor | int] = {
+        "action_horizon": int(action_horizon),
+        "proprio": proprio,
+    }
+    dim_is_pad = inference_cfg.get("proprio_dim_is_pad")
+    if dim_is_pad is not None:
+        dim_is_pad = torch.as_tensor(
+            OmegaConf.to_container(dim_is_pad, resolve=True), dtype=torch.bool
+        ).reshape(-1)
+        if dim_is_pad.numel() != expected_state_dim:
+            raise ValueError(
+                "proprio_dim_is_pad must match the H3 state width "
+                f"{expected_state_dim}"
+            )
+        prepared["proprio_dim_is_pad"] = dim_is_pad
+    return prepared
+
 def run_inference(cfg: DictConfig):
     setup_logging(log_level=logging.INFO)
     inference_cfg = cfg.inference
@@ -519,20 +580,83 @@ def run_inference(cfg: DictConfig):
 
     infer_kwargs = {
         "prompt": str(inference_cfg.prompt),
-        "negative_prompt": str(inference_cfg.negative_prompt),
-        "text_cfg_scale": float(inference_cfg.text_cfg_scale),
-        "action_cfg_scale": float(inference_cfg.action_cfg_scale),
+        "negative_prompt": str(inference_cfg.get("negative_prompt", "")),
+        "text_cfg_scale": float(inference_cfg.get("text_cfg_scale", 1.0)),
+        "action_cfg_scale": float(inference_cfg.get("action_cfg_scale", 1.0)),
         "input_image": x,
         "num_frames": int(inference_cfg.num_frames),
         "num_inference_steps": int(inference_cfg.num_inference_steps),
         "sigma_shift": None if inference_cfg.get("sigma_shift") is None else float(inference_cfg.sigma_shift),
         "seed": int(inference_cfg.seed),
-        "rand_device": str(inference_cfg.rand_device),
-        "tiled": bool(inference_cfg.tiled),
+        "rand_device": str(inference_cfg.get("rand_device", "cpu")),
+        "tiled": bool(inference_cfg.get("tiled", False)),
     }
 
-    infer_out = model.infer(**infer_kwargs)
+    is_h3 = bool(
+        getattr(model, "inference_accepts_ground_truth_action", True) is False
+    )
+    if is_h3:
+        infer_kwargs.update(
+            _prepare_h3_inference_state(
+                inference_cfg,
+                expected_state_dim=int(model.action_expert.state_dim),
+            )
+        )
+        h3_cache_dir = inference_cfg.get("h3_condition_cache_dir")
+        if h3_cache_dir is not None:
+            from .datasets.h3_condition_cache import load_h3_condition_cache
+
+            cached = load_h3_condition_cache(
+                h3_cache_dir,
+                first_frame=x[0],
+                instruction=str(inference_cfg.prompt),
+            )
+            infer_kwargs.update(
+                {
+                    "prompt_embeds": cached["prompt_embeds"].unsqueeze(0),
+                    "prompt_token_tags": cached[
+                        "prompt_token_tags"
+                    ].unsqueeze(0),
+                    "prompt_attention_mask": cached[
+                        "prompt_attention_mask"
+                    ].unsqueeze(0),
+                }
+            )
+        elif getattr(model, "text_conditioner", None) is None:
+            raise ValueError(
+                "H3 inference with load_text_encoder=false requires "
+                "inference.h3_condition_cache_dir"
+            )
+
+    autocast_enabled = (
+        model.device.type == "cuda"
+        and model_dtype in {torch.float16, torch.bfloat16}
+    )
+    with torch.autocast(
+        device_type=model.device.type,
+        dtype=model_dtype,
+        enabled=autocast_enabled,
+    ):
+        infer_out = model.infer(**infer_kwargs)
     video = infer_out["video"]
-    save_mp4(video, output_mp4, fps=15)
+    output_fps = int(
+        inference_cfg.get("fps", getattr(model, "video_fps", 15))
+    )
+    save_mp4(video, output_mp4, fps=output_fps)
     logger.info("Saved inference video to %s", output_mp4)
+    if is_h3:
+        output_action = inference_cfg.get("output_action")
+        action_path = (
+            Path(str(output_action))
+            if output_action is not None
+            else Path(output_mp4).with_suffix(".action.pt")
+        )
+        action_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(infer_out["action"], action_path)
+        logger.info("Saved primary H3 action prediction to %s", action_path)
+        return {
+            "video_path": output_mp4,
+            "action_path": str(action_path),
+            "action": infer_out["action"],
+        }
     return output_mp4

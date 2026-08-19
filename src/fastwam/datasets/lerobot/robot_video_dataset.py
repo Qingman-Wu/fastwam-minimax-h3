@@ -14,6 +14,10 @@ from hydra.utils import instantiate
 from .base_lerobot_dataset import BaseLerobotDataset
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
+from ..h3_condition_cache import (
+    collate_h3_condition_samples,
+    load_h3_condition_cache,
+)
 from ..padding import fetch_unpadded_temporal_sample
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
@@ -33,6 +37,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         camera_key=None,
         processor=None,
         text_embedding_cache_dir=None,
+        h3_condition_cache_dir=None,
         context_len=128,
         pretrained_norm_stats=None,
         val_set_proportion=0.05,
@@ -68,6 +73,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
+        self.h3_condition_cache_dir = h3_condition_cache_dir
+        if (
+            self.text_embedding_cache_dir is not None
+            and self.h3_condition_cache_dir is not None
+        ):
+            raise ValueError(
+                "Legacy Wan text cache and native H3 first-frame cache are "
+                "mutually exclusive"
+            )
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
@@ -223,6 +237,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             context_mask = torch.ones_like(context_mask)
             data["context"] = context
             data["context_mask"] = context_mask
+        if self.h3_condition_cache_dir is not None:
+            data.update(
+                load_h3_condition_cache(
+                    self.h3_condition_cache_dir,
+                    first_frame=video[:, 0],
+                    instruction=instruction,
+                )
+            )
         return data
 
     def _get_cached_text_context(self, prompt: str):
@@ -269,3 +291,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
         return data
+
+    def collate_fn(self, samples):
+        return collate_h3_condition_samples(samples)

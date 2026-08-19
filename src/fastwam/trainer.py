@@ -217,6 +217,7 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
+            collate_fn=getattr(dataset, "collate_fn", None),
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
