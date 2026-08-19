@@ -335,31 +335,31 @@
 - Produces: create_fastwam_h3() with text/video/action scheduler and loss config validation; checkpoint schema version 2.
 - Consumes: H3 FL2VA component path and data-derived state/action dimensions.
 
-- [ ] **Step 1: Write failing config validation tests**
+- [x] **Step 1: Write failing config validation tests**
 
   Assert video_scheduler is required, lambda_video defaults to 1.0, load_text_encoder
   is not silently discarded, action hidden size is 1024, attention geometry is
   56x128, and video_attention_mask_mode defaults to bidirectional H3 packed attention.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_runtime_config.py -q
 
-- [ ] **Step 3: Wire all constructors and checkpoint state**
+- [x] **Step 3: Wire all constructors and checkpoint state**
 
   Runtime passes video/action schedule settings, keyframe strength, text encoder
   toggle, state dimension, rates, and both loss weights. Checkpoints save/load
   state encoder, Action Expert, any trainable H3 adapters, optimizer, step, and
   schema metadata; they reject the old action-only schema with a clear message.
 
-- [ ] **Step 4: Update dependencies and configs**
+- [x] **Step 4: Update dependencies and configs**
 
   Replace the incompatible transformers 4.49 pin with transformers==4.57.6,
   which exposes Qwen3VLModel and Qwen3VLConfig. Set lambda_video=1.0, lambda_action=1.0,
   keyframe_condition_strength=0.999, video shift 12.0, action shift 5.0, and
   remove comments describing a frozen action-only visual cache.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_runtime_config.py -q
     git add src/fastwam/runtime.py src/fastwam/models/minimax_h3/__init__.py configs/model/fastwam_h3.yaml configs/task/libero_h3_uncond_2cam224_1e-4.yaml pyproject.toml tests/models/minimax_h3/test_runtime_config.py

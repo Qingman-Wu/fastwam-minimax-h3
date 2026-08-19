@@ -149,6 +149,21 @@ def test_state_is_current_aligned_condition_and_invalid_dimensions_are_zero():
     assert torch.equal(state, torch.tensor([[1.0, 2.0, 0.0, 4.0]]))
 
 
+def test_state_condition_only_uses_f0_even_if_observation_mask_is_longer():
+    model = make_model()
+    sample = make_sample()
+    sample["proprio_is_pad"] = torch.tensor(
+        [[False, False, False, False, False]]
+    )
+
+    deterministic_training_loss(model, sample)
+
+    assert torch.equal(
+        model.video_expert.last_inputs["state_tokens"],
+        torch.tensor([[1.0, 2.0, 0.0, 4.0]]),
+    )
+
+
 def test_shared_progress_produces_separate_video_and_action_sigmas():
     model = make_model()
 

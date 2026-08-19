@@ -430,7 +430,7 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
-        return {
+        batched = {
             "video": video,
             "prompt": prompt,
             "action": action,
@@ -439,6 +439,25 @@ class Wan22Trainer:
             "context_mask": context_mask,
             "action_horizon": action_horizon,
         }
+        for key in (
+            "image_is_pad",
+            "action_is_pad",
+            "action_dim_is_pad",
+            "proprio_is_pad",
+            "proprio_dim_is_pad",
+        ):
+            value = sample.get(key)
+            if value is not None:
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(f"`sample[{key!r}]` must be a tensor")
+                if value.ndim == 1:
+                    value = value.unsqueeze(0)
+                if value.ndim != 2 or value.shape[0] != video.shape[0]:
+                    raise ValueError(
+                        f"`sample[{key!r}]` must be [B,L], got {tuple(value.shape)}"
+                    )
+                batched[key] = value
+        return batched
 
     @torch.no_grad()
     def evaluate(self):
@@ -470,7 +489,6 @@ class Wan22Trainer:
         infer_kwargs = {
             "input_image": input_image,
             "num_frames": num_frames,
-            "action": action,
             "action_horizon": sample['action_horizon'],
             "proprio": proprio,
             "text_cfg_scale": 1.0,
@@ -479,6 +497,10 @@ class Wan22Trainer:
             "seed": 42,
             "tiled": False,
         }
+        if bool(getattr(model, "inference_accepts_ground_truth_action", True)):
+            infer_kwargs["action"] = action
+        if sample.get("proprio_dim_is_pad") is not None:
+            infer_kwargs["proprio_dim_is_pad"] = sample["proprio_dim_is_pad"]
         if sample["context"] is not None:
             infer_kwargs["prompt"] = None
             infer_kwargs["context"] = sample["context"][0]

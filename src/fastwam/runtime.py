@@ -11,10 +11,8 @@ import numpy as np
 from einops import repeat
 from omegaconf import OmegaConf
 
-from .trainer import Wan22Trainer
 from .utils.logging_config import get_logger, setup_logging
 from .utils.video_io import save_mp4
-from .utils import misc
 
 logger = get_logger(__name__)
 
@@ -168,32 +166,70 @@ def create_fastwam_h3(
     action_scheduler=None,
     video_scheduler=None,
     loss=None,
-    load_text_encoder: bool = False,
+    load_text_encoder: bool = True,
     mot_checkpoint_mixed_attn: bool = True,
+    keyframe_condition_strength: float = 0.999,
+    video_fps: float = 24.0,
+    action_fps: float = 8.0,
+    freeze_video_expert: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
-    """Build FastWAM with MiniMax-H3 as its visual world-model backbone."""
-    del load_text_encoder, mot_checkpoint_mixed_attn, video_scheduler
+    """Build the H3-native Scheme A video/action flow-matching policy."""
     from .models.minimax_h3.fastwam import FastWAMH3
 
     def as_dict(value, name: str):
         if isinstance(value, DictConfig):
             value = OmegaConf.to_container(value, resolve=True)
-        if value is None:
-            value = {}
         if not isinstance(value, dict):
             raise ValueError(f"`{name}` must resolve to a dict, got {type(value)}")
-        return value
+        return dict(value)
 
     video_dit_config = as_dict(video_dit_config, "video_dit_config")
     action_dit_config = as_dict(action_dit_config, "action_dit_config")
+    if video_scheduler is None:
+        raise ValueError("`video_scheduler` is required for FastWAM-H3 Scheme A")
+    if action_scheduler is None:
+        raise ValueError("`action_scheduler` is required for FastWAM-H3 Scheme A")
+    video_scheduler = as_dict(video_scheduler, "video_scheduler")
     action_scheduler = as_dict(action_scheduler, "action_scheduler")
-    loss = as_dict(loss, "loss")
+    loss = {} if loss is None else as_dict(loss, "loss")
     required = {"train_shift", "infer_shift", "num_train_timesteps"}
-    missing = required - set(action_scheduler)
-    if missing:
-        raise ValueError(f"`action_scheduler` is missing {sorted(missing)}.")
+    for name, scheduler in (
+        ("video_scheduler", video_scheduler),
+        ("action_scheduler", action_scheduler),
+    ):
+        missing = required - set(scheduler)
+        if missing:
+            raise ValueError(f"`{name}` is missing {sorted(missing)}")
+
+    geometry_keys = ("num_layers", "num_attention_heads", "attention_head_dim")
+    geometry_mismatch = {
+        key: (video_dit_config.get(key), action_dit_config.get(key))
+        for key in geometry_keys
+        if video_dit_config.get(key) != action_dit_config.get(key)
+    }
+    if geometry_mismatch:
+        raise ValueError(
+            "H3 video/action attention geometry must match: "
+            f"{geometry_mismatch}"
+        )
+    if video_dit_config.get("video_attention_mask_mode", "bidirectional") != "bidirectional":
+        raise ValueError(
+            "FastWAM-H3 Scheme A requires bidirectional packed H3 attention"
+        )
+    if proprio_dim is None or int(proprio_dim) <= 0:
+        raise ValueError("`proprio_dim` must be a positive state width")
+    configured_state_dim = action_dit_config.get("state_dim")
+    if configured_state_dim is not None and int(configured_state_dim) != int(proprio_dim):
+        raise ValueError(
+            "action_dit_config.state_dim must match proprio_dim: "
+            f"{configured_state_dim} != {proprio_dim}"
+        )
+    action_dit_config["state_dim"] = int(proprio_dim)
+    action_dit_config["use_gradient_checkpointing"] = bool(
+        mot_checkpoint_mixed_attn
+    )
 
     return FastWAMH3.from_pretrained(
         model_path=model_path,
@@ -201,13 +237,21 @@ def create_fastwam_h3(
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
-        proprio_dim=None if proprio_dim is None else int(proprio_dim),
+        load_text_encoder=bool(load_text_encoder),
         device=device,
         torch_dtype=model_dtype,
+        video_train_shift=float(video_scheduler["train_shift"]),
+        video_infer_shift=float(video_scheduler["infer_shift"]),
+        video_num_train_timesteps=int(video_scheduler["num_train_timesteps"]),
         action_train_shift=float(action_scheduler["train_shift"]),
         action_infer_shift=float(action_scheduler["infer_shift"]),
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        keyframe_condition_strength=float(keyframe_condition_strength),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        video_fps=float(video_fps),
+        action_fps=float(action_fps),
+        freeze_video_expert=bool(freeze_video_expert),
     )
 
 
@@ -384,6 +428,8 @@ def create_fastwam_idm(
 
 
 def build_datasets(data_cfg: DictConfig):
+    from .utils import misc
+
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:
         val_ds = train_ds
@@ -410,6 +456,9 @@ def _resolve_train_device() -> str:
 
 
 def run_training(cfg: DictConfig):
+    from .trainer import Wan22Trainer
+    from .utils import misc
+
     setup_logging(
         log_level=logging.INFO,
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,

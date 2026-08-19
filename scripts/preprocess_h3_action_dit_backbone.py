@@ -88,9 +88,12 @@ def _load_action_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path} must define action_dit_config as a mapping.")
     unresolved = [key for key, item in value.items() if isinstance(item, str) and "${" in item]
     for key in unresolved:
-        if key == "action_dim":
-            value[key] = 7
-            print("[WARN] action_dim is unresolved; using 7 for backbone preprocessing.")
+        if key in {"action_dim", "state_dim"}:
+            value[key] = 7 if key == "action_dim" else 8
+            print(
+                f"[WARN] {key} is unresolved; using {value[key]} for "
+                "LIBERO backbone preprocessing."
+            )
         elif key == "use_gradient_checkpointing":
             value[key] = False
         else:

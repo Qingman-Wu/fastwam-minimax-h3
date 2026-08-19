@@ -215,11 +215,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             task = self.override_instruction
         instruction = DEFAULT_PROMPT.format(task=task)
 
-        context, context_mask = self._get_cached_text_context(instruction)
-        # NOTE: to keep consistent with wan2.2's behavior
-        context[~context_mask] = 0.0
-        context_mask = torch.ones_like(context_mask)
-        
         data = {
             "video": video,
             "action": action,
@@ -231,6 +226,17 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if "action_dim_is_pad" in sample:
+            data["action_dim_is_pad"] = sample["action_dim_is_pad"]
+        if "proprio_dim_is_pad" in sample:
+            data["proprio_dim_is_pad"] = sample["proprio_dim_is_pad"]
+        if self.text_embedding_cache_dir is not None:
+            context, context_mask = self._get_cached_text_context(instruction)
+            # Keep the legacy Wan2.2 cache behavior unchanged for non-H3 runs.
+            context[~context_mask] = 0.0
+            context_mask = torch.ones_like(context_mask)
+            data["context"] = context
+            data["context_mask"] = context_mask
         return data
 
     def _get_cached_text_context(self, prompt: str):

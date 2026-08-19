@@ -23,6 +23,8 @@ from .video_vae import MiniMaxH3VAEAdapter, augment_keyframe_latents
 class FastWAMH3(nn.Module):
     """H3 full-video target plus a state-prefixed independent Action Expert."""
 
+    inference_accepts_ground_truth_action = False
+
     def __init__(
         self,
         *,
@@ -305,13 +307,19 @@ class FastWAMH3(nn.Module):
                 f"proprio state width must be {self.action_expert.state_dim}, got "
                 f"{proprio.shape[-1]}"
             )
-        state_is_pad = self._normalize_batch_mask(
-            sample.get("proprio_is_pad"),
-            batch_size=batch_size,
-            length=proprio.shape[1],
-            name="proprio_is_pad",
-            device=self.device,
-        )
+        state_is_pad = sample.get("proprio_is_pad")
+        if state_is_pad is None:
+            state_is_pad = torch.zeros(
+                (batch_size, 1), dtype=torch.bool, device=self.device
+            )
+        else:
+            state_is_pad = state_is_pad.to(device=self.device, dtype=torch.bool)
+            if state_is_pad.ndim == 1:
+                state_is_pad = state_is_pad.unsqueeze(0).expand(batch_size, -1)
+            if state_is_pad.ndim != 2 or state_is_pad.shape[0] != batch_size:
+                raise ValueError("proprio_is_pad must be [B,T] or [T]")
+            if state_is_pad.shape[1] < 1:
+                raise ValueError("proprio_is_pad must include the f0-aligned state")
         if state_is_pad[:, 0].any():
             raise ValueError("state aligned with f0 cannot be padded")
         state = proprio[:, 0].to(device=self.device, dtype=self.torch_dtype)

@@ -37,7 +37,7 @@ dependencies = [
   "torchcodec==0.5",
   "torchvision==0.22.1+cu128",
   "tqdm==4.66.5",
-  "transformers==4.49.0",
+  "transformers==4.57.6",
   "typing-extensions==4.15.0",
   "wandb==0.23.1",
 ]

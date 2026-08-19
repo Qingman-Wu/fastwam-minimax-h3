@@ -1,10 +1,14 @@
 _target_: fastwam.runtime.create_fastwam_h3
 model_path: /root/wuqingman/models/MiniMax-H3/FL2VA
-load_text_encoder: false
+load_text_encoder: true
 proprio_dim: ${data.train.processor.proprio_output_dim}
 mot_checkpoint_mixed_attn: true
-action_dit_pretrained_path: checkpoints/H3ActionDiT_video_interp_512hdim.pt
+action_dit_pretrained_path: checkpoints/H3ActionDiT_video_interp_1024hdim.pt
 skip_dit_load_from_pretrain: false
+keyframe_condition_strength: 0.999
+video_fps: 24.0
+action_fps: 8.0
+freeze_video_expert: true
 
 # Full MiniMax H3 FL2VA video expert. These values are checked against
 # FL2VA/transformer/config.json at load time.
@@ -15,7 +19,6 @@ video_dit_config:
   num_attention_heads: 56
   attention_head_dim: 128
   latents_dim: 24
-  audio_latents_dim: 32
   patch_size: [1, 2, 2]
   text_dim: 5120
   timestep_input_dim: 256
@@ -25,22 +28,23 @@ video_dit_config:
   norm_eps: 1.0e-05
   qk_norm_eps: 1.0e-05
   final_norm_eps: 1.0e-05
-  video_attention_mask_mode: "first_frame_causal"
+  video_attention_mask_mode: "bidirectional"
 
-# Width-reduced H3 block stack: 0.971B parameters with LIBERO action_dim=7.
+# Independent width-reduced Action Expert. Its input is exactly one current-state
+# condition token followed by noisy action target tokens.
 # Layer count and attention geometry stay identical to the video expert so
 # their Q/K/V tensors can participate in the same MoT attention operation.
 action_dit_config:
   action_dim: ${data.train.processor.action_output_dim}
-  context_dim: 4096
-  hidden_size: 512
-  ffn_hidden_size: 2048
+  state_dim: ${data.train.processor.proprio_output_dim}
+  hidden_size: 1024
+  ffn_hidden_size: 4096
   num_layers: 50
   num_attention_heads: 56
   attention_head_dim: 128
   timestep_input_dim: 256
-  time_embed_hidden_size: 512
-  time_embed_dim: 512
+  time_embed_hidden_size: 1024
+  time_embed_dim: 1024
   rope_inv_freq_len: 16
   norm_eps: 1.0e-05
   qk_norm_eps: 1.0e-05
@@ -58,7 +62,6 @@ action_scheduler:
   num_train_timesteps: 1000
 
 loss:
-  # H3 is kept frozen: its public video pretraining replaces per-run video
-  # co-training while the action expert learns from layer-wise visual K/V.
-  lambda_video: 0.0
+  # Scheme A predicts and supervises every full-video latent, including z0.
+  lambda_video: 1.0
   lambda_action: 1.0

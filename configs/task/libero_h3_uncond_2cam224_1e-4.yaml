@@ -11,6 +11,10 @@ defaults:
 data:
   train:
     action_video_freq_ratio: 8
+    # H3 Qwen3-VL consumes f0 and instruction together; Wan/T5 text-only
+    # embeddings are not compatible with this conditioning path.
+    text_embedding_cache_dir: null
+    skip_padding_as_possible: true
 
 batch_size: 16
 num_workers: 16
@@ -25,15 +29,15 @@ num_epochs: 10
 max_steps: 100000
 log_every: 10
 save_every: 10000
-# Action training is the experiment target; video rollout evaluation is not
-# meaningful while the public H3 backbone is intentionally frozen.
+# Full-video and action flow-matching losses are both active in Scheme A.
 eval_every: 0
 
 # 16 samples/GPU x 8 GPUs keeps the original effective global batch at 128.
 gradient_accumulation_steps: 1
 weight_decay: 1.0e-2
-resume: ./runs/libero_h3_uncond_2cam224_1e-4/experiment37_h3_libero_v2/checkpoints/weights/step_002000.pt
-initial_step: 2000
+# Action-only H3 checkpoints use the incompatible pre-Scheme-A schema.
+resume: null
+initial_step: 0
 
 swanlab:
   enabled: true
