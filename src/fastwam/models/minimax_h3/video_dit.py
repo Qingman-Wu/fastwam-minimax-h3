@@ -11,6 +11,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from safetensors import safe_open
 
 from .mixed_attention import AsymmetricAttentionMasks, run_asymmetric_joint_block

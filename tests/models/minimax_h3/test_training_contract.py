@@ -184,7 +184,7 @@ def test_keyframe_is_near_clean_and_has_no_loss_row():
     assert "keyframe_loss_mask" not in model.video_expert.last_inputs
 
 
-def test_real_tiny_experts_run_scheme_a_full_video_and_action_forward():
+def test_real_tiny_experts_run_scheme_a_checkpointed_forward_and_backward():
     torch.manual_seed(17)
     video_expert = MiniMaxH3VideoBackbone(
         hidden_size=8,
@@ -200,7 +200,7 @@ def test_real_tiny_experts_run_scheme_a_full_video_and_action_forward():
         time_embed_hidden_size=8,
         time_embed_dim=8,
         rope_inv_freq_len=1,
-    ).eval()
+    ).train()
     action_expert = H3ActionDiT(
         action_dim=3,
         state_dim=4,
@@ -213,8 +213,8 @@ def test_real_tiny_experts_run_scheme_a_full_video_and_action_forward():
         time_embed_hidden_size=8,
         time_embed_dim=8,
         rope_inv_freq_len=1,
-        use_gradient_checkpointing=False,
-    ).eval()
+        use_gradient_checkpointing=True,
+    ).train()
 
     output = video_expert.forward_joint(
         action_expert=action_expert,
@@ -241,3 +241,21 @@ def test_real_tiny_experts_run_scheme_a_full_video_and_action_forward():
     assert output["debug"]["keyframe_rows"] == 4
     assert output["debug"]["video_target_rows"] == 8
     assert output["debug"]["audio_rows"] == 0
+
+    loss = (
+        output["video_prediction"].float().square().mean()
+        + output["action_prediction"].float().square().mean()
+    )
+    loss.backward()
+    video_grads = [
+        parameter.grad
+        for parameter in video_expert.parameters()
+        if parameter.grad is not None
+    ]
+    action_grads = [
+        parameter.grad
+        for parameter in action_expert.parameters()
+        if parameter.grad is not None
+    ]
+    assert video_grads and action_grads
+    assert all(torch.isfinite(grad).all() for grad in video_grads + action_grads)
