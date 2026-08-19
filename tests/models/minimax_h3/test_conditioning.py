@@ -1,14 +1,19 @@
 import pytest
 import torch
 import torch.nn as nn
+import json
 from types import SimpleNamespace
+from safetensors import TensorSpec, serialize_file
 
 from fastwam.models.minimax_h3.text_encoder import (
     H3TextConditionBatch,
     MiniMaxH3TextConditioner,
     build_fl2va_presentation,
 )
-from fastwam.models.minimax_h3.video_dit import MiniMaxH3VideoBackbone
+from fastwam.models.minimax_h3.video_dit import (
+    MiniMaxH3VideoBackbone,
+    load_h3_video_backbone,
+)
 from fastwam.models.minimax_h3.video_vae import (
     MiniMaxH3VAEAdapter,
     augment_keyframe_latents,
@@ -113,6 +118,57 @@ def make_tiny_video_dit():
         time_embed_dim=6,
         rope_inv_freq_len=1,
     ).eval()
+
+
+def test_h3_loader_preserves_checkpoint_parameter_dtypes(tmp_path):
+    config = {
+        "hidden_size": 12,
+        "ffn_hidden_size": 16,
+        "num_layers": 0,
+        "token_refiner_num_layers": 0,
+        "num_attention_heads": 3,
+        "attention_head_dim": 4,
+        "latents_dim": 2,
+        "patch_size": [1, 2, 2],
+        "text_dim": 5,
+        "timestep_input_dim": 4,
+        "time_embed_hidden_size": 8,
+        "time_embed_dim": 6,
+        "rope_inv_freq_len": 1,
+    }
+    source = MiniMaxH3VideoBackbone(**config)
+    state = {
+        name: tensor.detach().to(
+            torch.float32 if name == "video_patch_proj.weight" else torch.bfloat16
+        ).contiguous()
+        for name, tensor in source.state_dict().items()
+    }
+    shard_name = "model-00001-of-00001.safetensors"
+    serialize_file(
+        {
+            name: TensorSpec(
+                dtype=(
+                    "float32" if tensor.dtype == torch.float32 else "bfloat16"
+                ),
+                shape=list(tensor.shape),
+                data_ptr=tensor.data_ptr(),
+                data_len=tensor.nbytes,
+            )
+            for name, tensor in state.items()
+        },
+        tmp_path / shard_name,
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: shard_name for name in state}})
+    )
+
+    loaded = load_h3_video_backbone(
+        tmp_path, device="cpu", dtype=torch.bfloat16
+    )
+
+    assert loaded.video_patch_proj.weight.dtype == torch.float32
+    assert loaded.condition_proj.weight.dtype == torch.bfloat16
 
 
 def test_h3_scheme_a_backbone_defaults_to_bidirectional_attention():

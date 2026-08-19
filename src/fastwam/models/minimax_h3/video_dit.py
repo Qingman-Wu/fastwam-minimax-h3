@@ -857,7 +857,10 @@ def load_h3_video_backbone(
     loaded: set[str] = set()
     for shard_name, keys in sorted(jobs.items()):
         with safe_open(transformer_dir / shard_name, framework="pt", device="cpu") as handle:
-            shard = {key: handle.get_tensor(key).to(dtype=dtype) for key in keys}
+            # The official H3 checkpoint intentionally keeps a small set of
+            # projections in fp32. Preserve every stored dtype instead of
+            # flattening the entire visual expert to the requested AMP dtype.
+            shard = {key: handle.get_tensor(key) for key in keys}
         incompatible = model.load_state_dict(shard, strict=False, assign=True)
         unexpected = set(incompatible.unexpected_keys)
         if unexpected:
@@ -867,4 +870,4 @@ def load_h3_video_backbone(
     missing = target_keys - loaded
     if missing:
         raise RuntimeError(f"Did not load all H3 visual parameters: {sorted(missing)[:10]}")
-    return model.to(device=device, dtype=dtype).eval()
+    return model.to(device=device).eval()
