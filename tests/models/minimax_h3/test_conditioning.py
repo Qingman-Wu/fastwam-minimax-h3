@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import json
 from types import SimpleNamespace
-from safetensors import TensorSpec, serialize_file
+from safetensors.torch import save_file
 
 from fastwam.models.minimax_h3.text_encoder import (
     H3TextConditionBatch,
@@ -121,6 +121,7 @@ def make_tiny_video_dit():
 
 
 def test_h3_loader_preserves_checkpoint_parameter_dtypes(tmp_path):
+    pytest.importorskip("numpy")
     config = {
         "hidden_size": 12,
         "ffn_hidden_size": 16,
@@ -144,20 +145,7 @@ def test_h3_loader_preserves_checkpoint_parameter_dtypes(tmp_path):
         for name, tensor in source.state_dict().items()
     }
     shard_name = "model-00001-of-00001.safetensors"
-    serialize_file(
-        {
-            name: TensorSpec(
-                dtype=(
-                    "float32" if tensor.dtype == torch.float32 else "bfloat16"
-                ),
-                shape=list(tensor.shape),
-                data_ptr=tensor.data_ptr(),
-                data_len=tensor.nbytes,
-            )
-            for name, tensor in state.items()
-        },
-        tmp_path / shard_name,
-    )
+    save_file(state, str(tmp_path / shard_name))
     (tmp_path / "config.json").write_text(json.dumps(config))
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {name: shard_name for name in state}})
