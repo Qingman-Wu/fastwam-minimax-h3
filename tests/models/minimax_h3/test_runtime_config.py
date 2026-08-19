@@ -4,9 +4,14 @@ import tomllib
 import pytest
 import torch
 from omegaconf import OmegaConf
+from PIL import Image
 
 from fastwam.models.minimax_h3.fastwam import FastWAMH3
-from fastwam.runtime import _prepare_h3_inference_state, create_fastwam_h3
+from fastwam.runtime import (
+    _prepare_h3_inference_state,
+    create_fastwam_h3,
+    run_inference,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -156,3 +161,70 @@ def test_h3_cli_inference_rejects_missing_state():
 
     with pytest.raises(ValueError, match="proprio"):
         _prepare_h3_inference_state(inference, expected_state_dim=4)
+
+
+def test_h3_cli_inference_passes_state_and_persists_primary_action(
+    monkeypatch, tmp_path
+):
+    class FakeH3Model:
+        inference_accepts_ground_truth_action = False
+        device = torch.device("cpu")
+        torch_dtype = torch.float32
+        video_fps = 24.0
+        text_conditioner = object()
+        action_expert = type("ActionInfo", (), {"state_dim": 4})()
+
+        def __init__(self):
+            self.kwargs = None
+
+        def eval(self):
+            return self
+
+        def infer(self, **kwargs):
+            self.kwargs = kwargs
+            return {"video": [object()], "action": torch.arange(6).view(2, 3)}
+
+    model = FakeH3Model()
+    saved_video = {}
+    monkeypatch.setattr("fastwam.runtime.instantiate", lambda *args, **kwargs: model)
+    monkeypatch.setattr(
+        "fastwam.runtime.save_mp4",
+        lambda video, path, fps: saved_video.update(
+            {"video": video, "path": path, "fps": fps}
+        ),
+    )
+    image_path = tmp_path / "f0.png"
+    Image.new("RGB", (32, 32)).save(image_path)
+    output_mp4 = tmp_path / "aux.mp4"
+    cfg = OmegaConf.create(
+        {
+            "mixed_precision": "no",
+            "model": {"_target_": "unused"},
+            "inference": {
+                "device": "cpu",
+                "input_image_path": str(image_path),
+                "width": 32,
+                "height": 32,
+                "output_mp4": str(output_mp4),
+                "prompt": "move",
+                "num_frames": 5,
+                "num_inference_steps": 3,
+                "seed": 1,
+                "action_horizon": 2,
+                "proprio": [0.1, 0.2, 0.3, 0.4],
+            },
+        }
+    )
+
+    result = run_inference(cfg)
+
+    assert model.kwargs["action_horizon"] == 2
+    assert model.kwargs["proprio"].shape == (4,)
+    assert "action" not in model.kwargs
+    assert saved_video["fps"] == 24
+    assert result["video_path"] == str(output_mp4)
+    assert result["action_path"].endswith("aux.action.pt")
+    assert torch.equal(
+        torch.load(result["action_path"], weights_only=True),
+        torch.arange(6).view(2, 3),
+    )
