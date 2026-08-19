@@ -251,6 +251,9 @@ def test_real_tiny_experts_run_scheme_a_checkpointed_forward_and_backward():
     assert output["debug"]["keyframe_rows"] == 4
     assert output["debug"]["video_target_rows"] == 8
     assert output["debug"]["audio_rows"] == 0
+    assert torch.allclose(
+        output["debug"]["action_progress"], torch.tensor([0.7, 0.4])
+    )
 
     loss = (
         output["video_prediction"].float().square().mean()

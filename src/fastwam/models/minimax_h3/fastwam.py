@@ -476,6 +476,9 @@ class FastWAMH3(nn.Module):
             video_timestep_scale=float(
                 self.train_video_scheduler.num_train_timesteps
             ),
+            action_timestep_scale=float(
+                self.train_action_scheduler.num_train_timesteps
+            ),
         )
         video_prediction = predictions["video_prediction"]
         action_prediction = predictions["action_prediction"]
@@ -740,6 +743,9 @@ class FastWAMH3(nn.Module):
                 action_fps=self.action_fps,
                 video_timestep_scale=float(
                     self.infer_video_scheduler.num_train_timesteps
+                ),
+                action_timestep_scale=float(
+                    self.infer_action_scheduler.num_train_timesteps
                 ),
             )
             latents_video = self.infer_video_scheduler.step(

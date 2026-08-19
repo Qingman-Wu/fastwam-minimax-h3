@@ -469,6 +469,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
         video_fps: float,
         action_fps: float,
         video_timestep_scale: float = 1000.0,
+        action_timestep_scale: float = 1000.0,
         return_debug: bool = False,
     ) -> dict[str, Any]:
         """Run all aligned H3/Action layers for Scheme A."""
@@ -628,10 +629,18 @@ class MiniMaxH3VideoBackbone(nn.Module):
         )
         h3_combined_indices = inverse_indices * 3 + h3_tags
 
+        if action_timestep.shape != (batch_size,):
+            raise ValueError(f"action_timestep must be [{batch_size}]")
+        if float(action_timestep_scale) <= 0:
+            raise ValueError("action_timestep_scale must be positive")
+        action_progress = (
+            1.0 - action_timestep.float() / float(action_timestep_scale)
+        ).clamp(0.0, 1.0)
+
         action_state = action_expert.pre_dit(
             noisy_action_tokens,
             state_tokens,
-            action_timestep,
+            action_progress,
             position_ids=torch.stack(action_position_parts, dim=0),
         )
         action_stream_valid = torch.cat(
@@ -699,6 +708,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
                 "h3_valid": h3_valid,
                 "h3_condition": h3_condition,
                 "refiner_cu_seqlens": refiner_cu,
+                "action_progress": action_progress,
             }
         return output
 
