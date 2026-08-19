@@ -150,7 +150,7 @@
 - Produces: ActionExpertState, H3ActionDiT.pre_dit(actions, state, timestep, positions), H3ActionDiT.post_dit(tokens).
 - Consumes: normalized state [B,Ds], noisy actions [B,N,Da], action sigma/timestep, H3 layer Q/K/V.
 
-- [ ] **Step 1: Write failing prefix/output tests**
+- [x] **Step 1: Write failing prefix/output tests**
 
     def test_state_is_one_prefix_row_and_head_returns_only_actions(tiny_action_dit):
         state = torch.randn(2, 5)
@@ -167,28 +167,28 @@
         high = tiny_action_dit.pre_dit(action, state, torch.tensor([0.9])).tokens[:, 0]
         assert torch.allclose(low, high)
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_action_expert.py -q
 
-- [ ] **Step 3: Replace context/proprio concatenation with StateEncoder**
+- [x] **Step 3: Replace context/proprio concatenation with StateEncoder**
 
   H3ActionDiT receives state_dim and owns a two-layer StateEncoder to hidden_size.
   pre_dit concatenates one state token before action_encoder output. It returns a
   boolean state mask and action output indices. post_dit slices only action rows.
 
-- [ ] **Step 4: Apply action AdaLN only to action rows**
+- [x] **Step 4: Apply action AdaLN only to action rows**
 
   H3ActionBlock computes modulation from the action timestep, updates action
   rows with it, and leaves the state row unmodulated except for normal residual
   attention/MLP processing. No separate State AdaLN is introduced.
 
-- [ ] **Step 5: Replace standalone action RoPE with explicit H3 MM positions**
+- [x] **Step 5: Replace standalone action RoPE with explicit H3 MM positions**
 
   pre_dit accepts [B,1+N,3] positions and uses the same MiniMaxH3Rope frequency
   construction as the video expert.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_action_expert.py -q
     git add src/fastwam/models/minimax_h3/action_dit.py tests/models/minimax_h3/test_action_expert.py

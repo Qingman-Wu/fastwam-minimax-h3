@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .video_dit import H3RoPE
 
 
 class H3RMSNorm(nn.Module):
@@ -35,9 +38,21 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """Apply H3 RoPE to tensors shaped [B, S, H, Dh]."""
     rot_dim = int(freqs.shape[-1])
+    if rot_dim > x.shape[-1]:
+        raise ValueError(
+            f"RoPE rotates {rot_dim} dimensions but attention head has {x.shape[-1]}"
+        )
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    cos = freqs.cos().to(dtype=x.dtype).unsqueeze(0).unsqueeze(2)
-    sin = freqs.sin().to(dtype=x.dtype).unsqueeze(0).unsqueeze(2)
+    if freqs.ndim == 2:
+        cos = freqs.cos().to(dtype=x.dtype).unsqueeze(0).unsqueeze(2)
+        sin = freqs.sin().to(dtype=x.dtype).unsqueeze(0).unsqueeze(2)
+    elif freqs.ndim == 3 and freqs.shape[:2] == x.shape[:2]:
+        cos = freqs.cos().to(dtype=x.dtype).unsqueeze(2)
+        sin = freqs.sin().to(dtype=x.dtype).unsqueeze(2)
+    else:
+        raise ValueError(
+            f"freqs must be [S,R] or [B,S,R], got {tuple(freqs.shape)}"
+        )
     return torch.cat((x_rot * cos + _rotate_half(x_rot) * sin, x_pass), dim=-1)
 
 
@@ -138,22 +153,50 @@ class H3ActionBlock(nn.Module):
         values = self.adaln_proj(F.silu(time_embedding))
         return values.chunk(6, dim=-1)
 
+    @staticmethod
+    def modulate_action_rows(
+        hidden: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        modulated = hidden * (1 + scale[:, None]) + shift[:, None]
+        return torch.where(action_mask.unsqueeze(-1), modulated, hidden)
+
+    @staticmethod
+    def gate_action_rows(
+        update: torch.Tensor,
+        gate: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        gate_per_row = torch.where(
+            action_mask.unsqueeze(-1),
+            gate[:, None],
+            torch.ones_like(gate[:, None]),
+        )
+        return gate_per_row * update
+
     def forward(
         self,
         x: torch.Tensor,
         time_embedding: torch.Tensor,
         rope_freqs: torch.Tensor | None,
         attention_mask: torch.Tensor | None = None,
+        action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if action_mask is None:
+            action_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation(time_embedding)
         )
         h = self.norm1(x)
-        h = h * (1 + scale_msa[:, None]) + shift_msa[:, None]
-        x = x + gate_msa[:, None] * self.attn(h, rope_freqs, attention_mask)
+        h = self.modulate_action_rows(h, shift_msa, scale_msa, action_mask)
+        x = x + self.gate_action_rows(
+            self.attn(h, rope_freqs, attention_mask), gate_msa, action_mask
+        )
         h = self.norm2(x)
-        h = h * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        return x + gate_mlp[:, None] * self.mlp(h)
+        h = self.modulate_action_rows(h, shift_mlp, scale_mlp, action_mask)
+        return x + self.gate_action_rows(self.mlp(h), gate_mlp, action_mask)
 
     def forward_mixed(
         self,
@@ -205,12 +248,23 @@ class H3ActionBlock(nn.Module):
         return x + gate_mlp[:, None] * self.mlp(hidden)
 
 
+@dataclass(frozen=True)
+class ActionExpertState:
+    tokens: torch.Tensor
+    time_embedding: torch.Tensor
+    position_ids: torch.Tensor
+    rope_freqs: torch.Tensor
+    state_mask: torch.Tensor
+    action_mask: torch.Tensor
+    action_output_indices: torch.Tensor
+
+
 class H3ActionDiT(nn.Module):
     """~1B action expert initialized by width interpolation from MiniMax H3."""
 
     BACKBONE_SKIP_PREFIXES = (
         "action_encoder.",
-        "context_encoder.",
+        "state_encoder.",
         "final_norm.",
         "action_head.",
     )
@@ -226,13 +280,14 @@ class H3ActionDiT(nn.Module):
         "rope_inv_freq_len",
         "norm_eps",
         "qk_norm_eps",
-        "context_dim",
+        "state_dim",
     )
 
     def __init__(
         self,
         action_dim: int,
-        context_dim: int = 4096,
+        state_dim: int,
+        context_dim: int | None = None,
         hidden_size: int = 512,
         ffn_hidden_size: int = 2048,
         num_layers: int = 50,
@@ -247,8 +302,9 @@ class H3ActionDiT(nn.Module):
         use_gradient_checkpointing: bool = True,
     ) -> None:
         super().__init__()
+        del context_dim
         self.action_dim = int(action_dim)
-        self.context_dim = int(context_dim)
+        self.state_dim = int(state_dim)
         self.hidden_size = int(hidden_size)
         self.ffn_hidden_size = int(ffn_hidden_size)
         self.num_layers = int(num_layers)
@@ -265,8 +321,8 @@ class H3ActionDiT(nn.Module):
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
 
         self.action_encoder = nn.Linear(action_dim, hidden_size)
-        self.context_encoder = nn.Sequential(
-            nn.Linear(context_dim, hidden_size),
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
@@ -275,6 +331,7 @@ class H3ActionDiT(nn.Module):
             nn.SiLU(),
             nn.Linear(time_embed_hidden_size, time_embed_dim),
         )
+        self.rope = H3RoPE(rope_inv_freq_len)
         self.blocks = nn.ModuleList(
             [
                 H3ActionBlock(
@@ -359,20 +416,14 @@ class H3ActionDiT(nn.Module):
         args = timestep.float()[:, None] * freqs[None]
         return torch.cat((args.cos(), args.sin()), dim=-1)
 
-    def action_rope(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-        inv_steps = torch.arange(
-            self.rope_inv_freq_len, device=device, dtype=torch.float32
-        )
-        inv_freq = 1.0 / (10000.0 ** (inv_steps / self.rope_inv_freq_len))
-        axis = positions[:, None] * inv_freq[None]
-        # H3 rotates 96 dims: 16 frequencies for each of t/h/w, duplicated.
-        half = torch.cat((axis, torch.zeros_like(axis), torch.zeros_like(axis)), dim=-1)
-        return torch.cat((half, half), dim=-1)
-
     def pre_dit(
-        self, action_tokens: torch.Tensor, timestep: torch.Tensor
-    ) -> dict[str, Any]:
+        self,
+        action_tokens: torch.Tensor,
+        state_tokens: torch.Tensor | None,
+        timestep: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
+    ) -> ActionExpertState:
         if action_tokens.ndim != 3 or action_tokens.shape[-1] != self.action_dim:
             raise ValueError(
                 f"action_tokens must be [B,S,{self.action_dim}], got {tuple(action_tokens.shape)}"
@@ -381,119 +432,97 @@ class H3ActionDiT(nn.Module):
             raise ValueError("timestep must be [1] or [B].")
         if timestep.shape[0] == 1 and action_tokens.shape[0] > 1:
             timestep = timestep.expand(action_tokens.shape[0])
-        tokens = self.action_encoder(action_tokens)
+        if state_tokens is None:
+            raise ValueError("state_tokens are required for the Action Expert")
+        if state_tokens.ndim != 2 or state_tokens.shape != (
+            action_tokens.shape[0],
+            self.state_dim,
+        ):
+            raise ValueError(
+                f"state_tokens must be [B,{self.state_dim}], got "
+                f"{tuple(state_tokens.shape)}"
+            )
+        action_hidden = self.action_encoder(action_tokens)
+        state_hidden = self.state_encoder(
+            state_tokens.to(device=action_hidden.device, dtype=action_hidden.dtype)
+        ).unsqueeze(1)
+        tokens = torch.cat((state_hidden, action_hidden), dim=1)
         time_embedding = self.time_embedder(
             self.timestep_embedding(timestep).to(dtype=tokens.dtype)
         )
-        return {
-            "tokens": tokens,
-            "time_embedding": time_embedding,
-            "freqs": self.action_rope(tokens.shape[1], tokens.device),
-            "meta": {"batch_size": tokens.shape[0], "seq_len": tokens.shape[1]},
-        }
+        if position_ids is None:
+            position_ids = torch.zeros(
+                (*tokens.shape[:2], 3),
+                dtype=torch.float64,
+                device=tokens.device,
+            )
+            position_ids[:, 1:, 0] = torch.arange(
+                action_tokens.shape[1],
+                dtype=torch.float64,
+                device=tokens.device,
+            )
+        else:
+            if position_ids.shape != (*tokens.shape[:2], 3):
+                raise ValueError(
+                    f"position_ids must be [B,1+N,3], got {tuple(position_ids.shape)}"
+                )
+            position_ids = position_ids.to(device=tokens.device, dtype=torch.float64)
+        rope_freqs = torch.stack(
+            [self.rope(sample_positions) for sample_positions in position_ids], dim=0
+        )
+        state_mask = torch.zeros(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
+        state_mask[:, 0] = True
+        action_mask = ~state_mask
+        return ActionExpertState(
+            tokens=tokens,
+            time_embedding=time_embedding,
+            position_ids=position_ids,
+            rope_freqs=rope_freqs,
+            state_mask=state_mask,
+            action_mask=action_mask,
+            action_output_indices=torch.arange(
+                1, tokens.shape[1], device=tokens.device, dtype=torch.long
+            ),
+        )
 
     def post_dit(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.action_head(self.final_norm(tokens))
-
-    def forward_with_video_cache(
-        self,
-        action_tokens: torch.Tensor,
-        timestep: torch.Tensor,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
-        video_kv_cache: list[dict[str, torch.Tensor]],
-        video_tokens_per_frame: int,
-    ) -> torch.Tensor:
-        if len(video_kv_cache) != self.num_layers:
-            raise ValueError(
-                f"Expected {self.num_layers} H3 video cache layers, "
-                f"got {len(video_kv_cache)}."
-            )
-        state = self.pre_dit(action_tokens, timestep)
-        x = state["tokens"]
-        if context.ndim != 3 or context.shape[-1] != self.context_dim:
-            raise ValueError(
-                f"context must be [B,L,{self.context_dim}], got {tuple(context.shape)}"
-            )
-        if context_mask.shape != context.shape[:2]:
-            raise ValueError(
-                f"context_mask shape {tuple(context_mask.shape)} does not match "
-                f"context {tuple(context.shape[:2])}."
-            )
-        context_tokens = self.context_encoder(context.to(dtype=x.dtype))
-        for layer_idx, block in enumerate(self.blocks):
-            cache = video_kv_cache[layer_idx]
-            # Structured FastWAM mask: actions can see only the current frame.
-            video_k = cache["k"][:, :video_tokens_per_frame]
-            video_v = cache["v"][:, :video_tokens_per_frame]
-
-            def layer_forward(
-                action_hidden: torch.Tensor,
-                action_time: torch.Tensor,
-                action_rope: torch.Tensor,
-                cached_k: torch.Tensor,
-                cached_v: torch.Tensor,
-                language_tokens: torch.Tensor,
-                language_mask: torch.Tensor,
-                _block=block,
-            ) -> torch.Tensor:
-                return _block.forward_mixed(
-                    action_hidden,
-                    action_time,
-                    action_rope,
-                    cached_k,
-                    cached_v,
-                    language_tokens,
-                    language_mask,
-                )
-
-            if self.use_gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    layer_forward,
-                    x,
-                    state["time_embedding"],
-                    state["freqs"],
-                    video_k,
-                    video_v,
-                    context_tokens,
-                    context_mask,
-                    use_reentrant=False,
-                )
-            else:
-                x = layer_forward(
-                    x,
-                    state["time_embedding"],
-                    state["freqs"],
-                    video_k,
-                    video_v,
-                    context_tokens,
-                    context_mask,
-                )
-        return self.post_dit(x)
+        if tokens.ndim != 3 or tokens.shape[1] < 2:
+            raise ValueError("Action Expert output must contain state plus action rows")
+        return self.action_head(self.final_norm(tokens[:, 1:]))
 
     def forward(
         self,
         action_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        state = self.pre_dit(action_tokens, timestep)
-        x = state["tokens"]
+        state = self.pre_dit(
+            action_tokens,
+            state_tokens,
+            timestep,
+            position_ids=position_ids,
+        )
+        x = state.tokens
         for block in self.blocks:
             if self.use_gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
                     block,
                     x,
-                    state["time_embedding"],
-                    state["freqs"],
+                    state.time_embedding,
+                    state.rope_freqs,
                     attention_mask,
+                    state.action_mask,
                     use_reentrant=False,
                 )
             else:
                 x = block(
                     x,
-                    state["time_embedding"],
-                    state["freqs"],
+                    state.time_embedding,
+                    state.rope_freqs,
                     attention_mask,
+                    state.action_mask,
                 )
         return self.post_dit(x)
