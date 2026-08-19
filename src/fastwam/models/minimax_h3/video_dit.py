@@ -679,7 +679,11 @@ class MiniMaxH3VideoBackbone(nn.Module):
                     masks=masks,
                 )
 
-            if action_expert.use_gradient_checkpointing and self.training:
+            if (
+                action_expert.use_gradient_checkpointing
+                and action_expert.training
+                and torch.is_grad_enabled()
+            ):
                 h3_hidden, action_hidden = torch.utils.checkpoint.checkpoint(
                     layer_forward,
                     h3_hidden,

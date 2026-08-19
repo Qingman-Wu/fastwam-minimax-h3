@@ -1,8 +1,11 @@
 import pytest
 import torch
+import torch.nn as nn
+from types import SimpleNamespace
 
 from fastwam.models.minimax_h3.text_encoder import (
     H3TextConditionBatch,
+    MiniMaxH3TextConditioner,
     build_fl2va_presentation,
 )
 from fastwam.models.minimax_h3.video_dit import MiniMaxH3VideoBackbone
@@ -30,6 +33,43 @@ class LiteralTokenizer:
 class IdentityProcessor:
     def transform_tensor(self, value):
         return value
+
+
+class TinyImageProcessor:
+    merge_size = 1
+
+    def __call__(self, images, return_tensors):
+        assert len(images) == 1
+        assert return_tensors == "pt"
+        return {
+            "pixel_values": torch.zeros(1, 3),
+            "image_grid_thw": torch.tensor([[1, 1, 1]]),
+        }
+
+
+class RecordingQwenModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.config = SimpleNamespace(image_token_id=103)
+        self.kwargs = None
+
+    def forward(self, **kwargs):
+        self.kwargs = kwargs
+        sequence_length = kwargs["input_ids"].shape[1]
+        hidden_states = tuple(
+            torch.full((1, sequence_length, 5120), float(layer))
+            for layer in range(65)
+        )
+        return SimpleNamespace(
+            last_hidden_state=hidden_states[-1],
+            hidden_states=hidden_states,
+        )
+
+
+class TinyQwenProcessor:
+    tokenizer = LiteralTokenizer()
+    image_processor = TinyImageProcessor()
 
 
 class TinyNativeVAE(torch.nn.Module):
@@ -108,6 +148,20 @@ def test_vae_process_image_route_produces_one_temporal_latent():
     assert torch.equal(video_latent, torch.full_like(video_latent, 2.0))
 
 
+@pytest.mark.parametrize(
+    ("num_frames", "latent_frames"),
+    [(5, 2), (22, 7), (39, 12)],
+)
+def test_h3_native_temporal_latent_length(num_frames, latent_frames):
+    assert MiniMaxH3VAEAdapter.latent_temporal_length(num_frames) == latent_frames
+
+
+@pytest.mark.parametrize("num_frames", [0, 4, 6, 21, 23])
+def test_h3_native_temporal_latent_length_rejects_unsupported_frames(num_frames):
+    with pytest.raises(ValueError, match=r"5\+17k"):
+        MiniMaxH3VAEAdapter.latent_temporal_length(num_frames)
+
+
 def test_fl2va_presentation_marks_first_frame_vision_separately_from_text():
     input_ids, tags = build_fl2va_presentation(
         LiteralTokenizer(), instruction="go", image_token_count=2
@@ -116,6 +170,21 @@ def test_fl2va_presentation_marks_first_frame_vision_separately_from_text():
     prefix = [ord(char) for char in "<Picture 1>: "]
     assert input_ids.tolist() == prefix + [101, 103, 103, 102, ord("g"), ord("o")]
     assert tags.tolist() == [1] * len(prefix) + [0, 0, 0, 0] + [1, 1]
+
+
+def test_qwen_conditioner_returns_h3_native_layer_50_not_final_layer():
+    model = RecordingQwenModel()
+    conditioner = MiniMaxH3TextConditioner(
+        processor=TinyQwenProcessor(),
+        model=model,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    batch = conditioner.encode([object()], ["go"])
+
+    assert torch.equal(batch.embeddings, torch.full_like(batch.embeddings, 50.0))
+    assert model.kwargs["output_hidden_states"] is True
 
 
 def test_precomputed_qwen_condition_requires_native_hidden_width_and_tags():

@@ -194,7 +194,7 @@ def test_keyframe_is_near_clean_and_has_no_loss_row():
     assert "keyframe_loss_mask" not in model.video_expert.last_inputs
 
 
-def test_real_tiny_experts_run_scheme_a_checkpointed_forward_and_backward():
+def test_real_tiny_experts_checkpoint_action_when_frozen_video_is_eval(monkeypatch):
     torch.manual_seed(17)
     video_expert = MiniMaxH3VideoBackbone(
         hidden_size=8,
@@ -210,7 +210,7 @@ def test_real_tiny_experts_run_scheme_a_checkpointed_forward_and_backward():
         time_embed_hidden_size=8,
         time_embed_dim=8,
         rope_inv_freq_len=1,
-    ).train()
+    ).eval()
     action_expert = H3ActionDiT(
         action_dim=3,
         state_dim=4,
@@ -225,6 +225,15 @@ def test_real_tiny_experts_run_scheme_a_checkpointed_forward_and_backward():
         rope_inv_freq_len=1,
         use_gradient_checkpointing=True,
     ).train()
+    original_checkpoint = torch.utils.checkpoint.checkpoint
+    checkpoint_calls = 0
+
+    def recording_checkpoint(*args, **kwargs):
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        return original_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recording_checkpoint)
 
     output = video_expert.forward_joint(
         action_expert=action_expert,
@@ -260,6 +269,7 @@ def test_real_tiny_experts_run_scheme_a_checkpointed_forward_and_backward():
         + output["action_prediction"].float().square().mean()
     )
     loss.backward()
+    assert checkpoint_calls == 1
     video_grads = [
         parameter.grad
         for parameter in video_expert.parameters()

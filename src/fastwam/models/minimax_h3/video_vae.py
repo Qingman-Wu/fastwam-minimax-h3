@@ -34,6 +34,15 @@ class MiniMaxH3VAEAdapter(nn.Module):
     temporal_downsample_factor = 4
     upsampling_factor = 16
 
+    @staticmethod
+    def latent_temporal_length(num_frames: int) -> int:
+        """Return H3's native temporal latent length for a 5+17k clip."""
+
+        num_frames = int(num_frames)
+        if num_frames < 5 or (num_frames - 5) % 17:
+            raise ValueError(f"H3 num_frames must be 5+17k, got {num_frames}")
+        return 2 + 5 * ((num_frames - 5) // 17)
+
     def __init__(
         self,
         component_dir: str | Path,

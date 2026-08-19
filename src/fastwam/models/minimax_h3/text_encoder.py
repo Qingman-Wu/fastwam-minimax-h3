@@ -14,6 +14,7 @@ VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
 IMAGE_PAD = "<|image_pad|>"
 H3_QWEN_HIDDEN_SIZE = 5120
+H3_QWEN_HIDDEN_LAYER = 50
 H3_VIDEO_TAG = 0
 H3_TEXT_TAG = 1
 
@@ -152,7 +153,6 @@ class MiniMaxH3TextConditioner(nn.Module):
             trust_remote_code=True,
         )
         model = causal_model.model
-        model.language_model.norm = nn.Identity()
         del causal_model
         return cls(processor=processor, model=model.to(device), device=device, dtype=dtype)
 
@@ -193,11 +193,17 @@ class MiniMaxH3TextConditioner(nn.Module):
                 ),
                 image_grid_thw=grid.to(self.device),
                 mm_token_type_ids=mm_token_type_ids,
-                output_hidden_states=False,
+                output_hidden_states=True,
                 use_cache=False,
                 return_dict=True,
             )
-            hidden = output.last_hidden_state[0]
+            hidden_states = output.hidden_states
+            if hidden_states is None or len(hidden_states) <= H3_QWEN_HIDDEN_LAYER:
+                raise ValueError(
+                    "H3 Qwen must return hidden_states through native layer "
+                    f"{H3_QWEN_HIDDEN_LAYER}"
+                )
+            hidden = hidden_states[H3_QWEN_HIDDEN_LAYER][0]
             if hidden.shape[-1] != H3_QWEN_HIDDEN_SIZE:
                 raise ValueError(
                     f"H3 Qwen returned hidden width {hidden.shape[-1]}, "

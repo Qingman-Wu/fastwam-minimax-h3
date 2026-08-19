@@ -647,9 +647,7 @@ class FastWAMH3(nn.Module):
             process_image=True,
         ).to(dtype=self.torch_dtype)
 
-        latent_t = (
-            num_frames - 1
-        ) // int(self.vae.temporal_downsample_factor) + 1
+        latent_t = MiniMaxH3VAEAdapter.latent_temporal_length(num_frames)
         latent_h = height // int(self.vae.upsampling_factor)
         latent_w = width // int(self.vae.upsampling_factor)
         latent_channels = int(
