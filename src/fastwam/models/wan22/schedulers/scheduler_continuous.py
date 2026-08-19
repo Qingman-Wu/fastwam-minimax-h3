@@ -36,6 +36,20 @@ class WanContinuousFlowMatchScheduler:
         timestep = sigma * float(self.num_train_timesteps)
         return timestep.to(dtype=dtype)
 
+    def timestep_from_progress(
+        self, progress: torch.Tensor, dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        """Map shared base progress to this scheduler's shifted timestep."""
+
+        if not isinstance(progress, torch.Tensor) or progress.ndim != 1:
+            raise ValueError("progress must be a one-dimensional tensor")
+        if ((progress < 0) | (progress > 1)).any():
+            raise ValueError("progress values must be in [0, 1]")
+        timestep = self._phi(progress.float(), self.shift) * float(
+            self.num_train_timesteps
+        )
+        return timestep.to(dtype=progress.dtype if dtype is None else dtype)
+
     def training_weight(self, timestep: torch.Tensor) -> torch.Tensor:
         t = timestep.to(dtype=torch.float32)
         steps = float(self.num_train_timesteps)

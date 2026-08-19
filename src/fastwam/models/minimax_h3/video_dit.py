@@ -13,6 +13,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from .mixed_attention import AsymmetricAttentionMasks, run_asymmetric_joint_block
+from .packed_sequence import (
+    action_mm_position_ids,
+    build_batch_cu_seqlens,
+    build_h3_packed_sample,
+    state_mm_position_ids,
+)
+
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     left, right = torch.chunk(x, 2, dim=-1)
@@ -319,10 +327,22 @@ class H3FinalLayer(nn.Module):
         patch_dim = latents_dim * math.prod(patch_size)
         self.video_out = nn.Linear(hidden_size, patch_dim, bias=True)
 
-    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_embedding: torch.Tensor,
+        inverse_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         shift, scale = self.adaln_proj.linear(F.silu(time_embedding)).chunk(2, dim=-1)
+        if inverse_indices is not None:
+            flat_indices = inverse_indices.reshape(-1).to(dtype=torch.long)
+            shift = shift.index_select(0, flat_indices).view(*x.shape[:2], -1)
+            scale = scale.index_select(0, flat_indices).view(*x.shape[:2], -1)
+        else:
+            shift = shift[:, None]
+            scale = scale[:, None]
         hidden = self.norm(x)
-        hidden = hidden * (1 + scale[:, None]) + shift[:, None]
+        hidden = hidden * (1 + scale) + shift
         return self.video_out(hidden)
 
 
@@ -429,6 +449,257 @@ class MiniMaxH3VideoBackbone(nn.Module):
         ):
             raise ValueError("cu_seqlens must delimit every non-empty Qwen sample")
         return self.token_refiner(self.condition_proj(qwen_embeddings), cu_seqlens)
+
+    def forward_joint(
+        self,
+        *,
+        action_expert: nn.Module,
+        qwen_embeddings: torch.Tensor,
+        qwen_tags: torch.Tensor,
+        qwen_valid: torch.Tensor,
+        clean_keyframe_latents: torch.Tensor,
+        noisy_video_latents: torch.Tensor,
+        video_timestep: torch.Tensor,
+        noisy_action_tokens: torch.Tensor,
+        action_timestep: torch.Tensor,
+        state_tokens: torch.Tensor,
+        action_valid: torch.Tensor,
+        keyframe_condition_strength: float,
+        video_fps: float,
+        action_fps: float,
+        video_timestep_scale: float = 1000.0,
+        return_debug: bool = False,
+    ) -> dict[str, Any]:
+        """Run all aligned H3/Action layers for Scheme A."""
+
+        if qwen_embeddings.ndim != 3 or qwen_embeddings.shape[-1] != self.text_dim:
+            raise ValueError(
+                f"qwen_embeddings must be [B,L,{self.text_dim}], got "
+                f"{tuple(qwen_embeddings.shape)}"
+            )
+        batch_size, max_text_length = qwen_embeddings.shape[:2]
+        if qwen_tags.shape != (batch_size, max_text_length):
+            raise ValueError("qwen_tags must match qwen_embeddings [B,L]")
+        if qwen_valid.shape != (batch_size, max_text_length):
+            raise ValueError("qwen_valid must match qwen_embeddings [B,L]")
+        qwen_valid = qwen_valid.to(device=qwen_embeddings.device, dtype=torch.bool)
+        qwen_tags = qwen_tags.to(device=qwen_embeddings.device, dtype=torch.long)
+        text_lengths = qwen_valid.sum(dim=1).tolist()
+        if any(length <= 0 for length in text_lengths):
+            raise ValueError("every sample must contain at least one Qwen token")
+        if any(
+            not qwen_valid[index, : int(length)].all()
+            or qwen_valid[index, int(length) :].any()
+            for index, length in enumerate(text_lengths)
+        ):
+            raise ValueError("qwen_valid must be a contiguous prefix per sample")
+
+        keyframe_patches, keyframe_meta = self.patchify(clean_keyframe_latents)
+        video_patches, video_meta = self.patchify(noisy_video_latents)
+        if keyframe_meta["ft"] != 1:
+            raise ValueError("Scheme A requires exactly one keyframe latent slice")
+        if (keyframe_meta["fh"], keyframe_meta["fw"]) != (
+            video_meta["fh"],
+            video_meta["fw"],
+        ):
+            raise ValueError("keyframe and full-video latent grids must align")
+        keyframe_rows = keyframe_patches.shape[1]
+        video_rows = video_patches.shape[1]
+
+        flat_qwen = qwen_embeddings[qwen_valid]
+        flat_tags = qwen_tags[qwen_valid]
+        refiner_cu = build_batch_cu_seqlens(
+            [int(length) for length in text_lengths]
+        ).to(qwen_embeddings.device)
+        refined_flat = self.refine_text_condition(flat_qwen, flat_tags, refiner_cu)
+        qwen_hidden = qwen_embeddings.new_zeros(
+            (batch_size, max_text_length, self.hidden_size)
+        )
+        qwen_hidden[qwen_valid] = refined_flat
+        h3_hidden = torch.cat(
+            (
+                qwen_hidden,
+                self.video_patch_proj(keyframe_patches),
+                self.video_patch_proj(video_patches),
+            ),
+            dim=1,
+        )
+        h3_length = h3_hidden.shape[1]
+        h3_valid = torch.cat(
+            (
+                qwen_valid,
+                torch.ones(
+                    (batch_size, keyframe_rows + video_rows),
+                    dtype=torch.bool,
+                    device=h3_hidden.device,
+                ),
+            ),
+            dim=1,
+        )
+        h3_condition = torch.cat(
+            (
+                qwen_valid,
+                torch.ones(
+                    (batch_size, keyframe_rows),
+                    dtype=torch.bool,
+                    device=h3_hidden.device,
+                ),
+                torch.zeros(
+                    (batch_size, video_rows),
+                    dtype=torch.bool,
+                    device=h3_hidden.device,
+                ),
+            ),
+            dim=1,
+        )
+        h3_tags = torch.zeros(
+            (batch_size, h3_length), dtype=torch.long, device=h3_hidden.device
+        )
+        h3_tags[:, :max_text_length] = qwen_tags.masked_fill(~qwen_valid, 0)
+
+        h3_position_ids = torch.zeros(
+            (batch_size, h3_length, 3),
+            dtype=torch.float64,
+            device=h3_hidden.device,
+        )
+        action_position_parts: list[torch.Tensor] = []
+        for batch_index, text_length_value in enumerate(text_lengths):
+            text_length = int(text_length_value)
+            packed = build_h3_packed_sample(
+                qwen_tags=qwen_tags[batch_index, :text_length],
+                latent_t=video_meta["ft"],
+                latent_h=video_meta["height"],
+                latent_w=video_meta["width"],
+                keyframe_count=1,
+            )
+            h3_position_ids[batch_index, :text_length] = packed.position_ids[
+                :text_length
+            ]
+            h3_position_ids[
+                batch_index,
+                max_text_length : max_text_length + keyframe_rows,
+            ] = packed.position_ids[
+                text_length : text_length + keyframe_rows
+            ]
+            h3_position_ids[
+                batch_index,
+                max_text_length + keyframe_rows :,
+            ] = packed.position_ids[text_length + keyframe_rows :]
+            state_position = state_mm_position_ids(
+                batch_size=1,
+                text_origin=text_length,
+                device=h3_hidden.device,
+            )[0]
+            action_positions = action_mm_position_ids(
+                action_length=noisy_action_tokens.shape[1],
+                text_origin=text_length,
+                video_fps=video_fps,
+                action_fps=action_fps,
+                device=h3_hidden.device,
+            )
+            action_position_parts.append(
+                torch.cat((state_position, action_positions), dim=0)
+            )
+        h3_rope_freqs = torch.stack(
+            [self.rope(position_ids) for position_ids in h3_position_ids], dim=0
+        )
+
+        if video_timestep.shape != (batch_size,):
+            raise ValueError(f"video_timestep must be [{batch_size}]")
+        if float(video_timestep_scale) <= 0:
+            raise ValueError("video_timestep_scale must be positive")
+        target_progress = (
+            1.0 - video_timestep.float() / float(video_timestep_scale)
+        ).clamp(0.0, 1.0)
+        token_progress = target_progress[:, None].expand(-1, h3_length).clone()
+        token_progress[:, max_text_length : max_text_length + keyframe_rows] = (
+            torch.maximum(
+                target_progress,
+                torch.full_like(target_progress, float(keyframe_condition_strength)),
+            )[:, None]
+        )
+        unique_progress, inverse_indices = torch.unique(
+            token_progress.reshape(-1), sorted=True, return_inverse=True
+        )
+        inverse_indices = inverse_indices.view(batch_size, h3_length)
+        h3_time_embedding = self.time_embedder(
+            unique_progress, h3_hidden.dtype
+        )
+        h3_combined_indices = inverse_indices * 3 + h3_tags
+
+        action_state = action_expert.pre_dit(
+            noisy_action_tokens,
+            state_tokens,
+            action_timestep,
+            position_ids=torch.stack(action_position_parts, dim=0),
+        )
+        action_stream_valid = torch.cat(
+            (
+                torch.ones(
+                    (batch_size, 1), dtype=torch.bool, device=h3_hidden.device
+                ),
+                action_valid.to(device=h3_hidden.device, dtype=torch.bool),
+            ),
+            dim=1,
+        )
+        masks = AsymmetricAttentionMasks(
+            h3_valid=h3_valid,
+            h3_condition=h3_condition,
+            action_valid=action_stream_valid,
+        )
+        action_hidden = action_state.tokens
+        for h3_block, action_block in zip(self.blocks, action_expert.blocks):
+            def layer_forward(
+                current_h3: torch.Tensor,
+                current_action: torch.Tensor,
+                _h3_block=h3_block,
+                _action_block=action_block,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                return run_asymmetric_joint_block(
+                    h3_block=_h3_block,
+                    action_block=_action_block,
+                    h3_hidden=current_h3,
+                    action_hidden=current_action,
+                    h3_time_embedding=h3_time_embedding,
+                    h3_combined_indices=h3_combined_indices,
+                    action_time_embedding=action_state.time_embedding,
+                    h3_rope_freqs=h3_rope_freqs,
+                    action_rope_freqs=action_state.rope_freqs,
+                    action_target_mask=action_state.action_mask,
+                    masks=masks,
+                )
+
+            if action_expert.use_gradient_checkpointing and self.training:
+                h3_hidden, action_hidden = torch.utils.checkpoint.checkpoint(
+                    layer_forward,
+                    h3_hidden,
+                    action_hidden,
+                    use_reentrant=False,
+                )
+            else:
+                h3_hidden, action_hidden = layer_forward(
+                    h3_hidden, action_hidden
+                )
+
+        video_logits = self.final_layer(
+            h3_hidden, h3_time_embedding, inverse_indices
+        )[:, max_text_length + keyframe_rows :]
+        video_prediction = -self.unpatchify(video_logits, video_meta)
+        action_prediction = action_expert.post_dit(action_hidden)
+        output: dict[str, Any] = {
+            "video_prediction": video_prediction,
+            "action_prediction": action_prediction,
+        }
+        if return_debug:
+            output["debug"] = {
+                "keyframe_rows": keyframe_rows,
+                "video_target_rows": video_rows,
+                "audio_rows": 0,
+                "h3_valid": h3_valid,
+                "h3_condition": h3_condition,
+                "refiner_cu_seqlens": refiner_cu,
+            }
+        return output
 
     def patchify(self, latents: torch.Tensor) -> tuple[torch.Tensor, dict[str, int]]:
         batch, channels, frames, height, width = latents.shape

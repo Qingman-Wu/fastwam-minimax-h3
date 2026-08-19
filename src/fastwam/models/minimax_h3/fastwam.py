@@ -1,9 +1,9 @@
-"""FastWAM policy using MiniMax-H3 as the frozen visual world backbone."""
+"""FastWAM-H3 Scheme A training and joint inference orchestration."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -15,17 +15,13 @@ from fastwam.models.wan22.schedulers.scheduler_continuous import (
 )
 
 from .action_dit import H3ActionDiT
+from .text_encoder import H3TextConditionBatch, MiniMaxH3TextConditioner
 from .video_dit import MiniMaxH3VideoBackbone, load_h3_video_backbone
-from .video_vae import MiniMaxH3VAEAdapter
+from .video_vae import MiniMaxH3VAEAdapter, augment_keyframe_latents
 
 
 class FastWAMH3(nn.Module):
-    """H3 visual prefill plus a trainable width-reduced action expert.
-
-    H3 is already video-pretrained, so the 33B visual backbone and visual VAE
-    remain frozen. The action expert is initialized from H3's video blocks and
-    learns through layer-wise attention to H3's current-frame K/V features.
-    """
+    """H3 full-video target plus a state-prefixed independent Action Expert."""
 
     def __init__(
         self,
@@ -33,30 +29,55 @@ class FastWAMH3(nn.Module):
         video_expert: MiniMaxH3VideoBackbone,
         action_expert: H3ActionDiT,
         vae: MiniMaxH3VAEAdapter,
-        proprio_dim: int | None,
-        context_dim: int,
+        text_conditioner: MiniMaxH3TextConditioner | None,
         device: str | torch.device,
         torch_dtype: torch.dtype,
+        video_train_shift: float,
+        video_infer_shift: float,
+        video_num_train_timesteps: int,
         action_train_shift: float,
         action_infer_shift: float,
         action_num_train_timesteps: int,
+        keyframe_condition_strength: float = 0.999,
+        loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        video_fps: float = 24.0,
+        action_fps: float = 8.0,
+        freeze_video_expert: bool = True,
     ) -> None:
         super().__init__()
+        if action_expert.num_layers != video_expert.num_layers:
+            raise ValueError("H3 action and video experts must have the same layer count")
+        if action_expert.num_heads != video_expert.num_heads:
+            raise ValueError("H3 action and video experts must have the same head count")
+        if action_expert.attn_head_dim != video_expert.attn_head_dim:
+            raise ValueError("H3 action and video experts must have the same head dimension")
+        if not 0.0 <= float(keyframe_condition_strength) <= 1.0:
+            raise ValueError("keyframe_condition_strength must be in [0, 1]")
+        if float(video_fps) <= 0 or float(action_fps) <= 0:
+            raise ValueError("video_fps and action_fps must be positive")
+
         self.video_expert = video_expert
         self.action_expert = action_expert
         self.vae = vae
+        self.text_conditioner = text_conditioner
         self.dit = action_expert
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
-        self.context_dim = int(context_dim)
-        self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
-        self.proprio_encoder = (
-            None
-            if self.proprio_dim is None
-            else nn.Linear(self.proprio_dim, self.context_dim).to(
-                device=self.device, dtype=self.torch_dtype
-            )
+        self.keyframe_condition_strength = float(keyframe_condition_strength)
+        self.loss_lambda_video = float(loss_lambda_video)
+        self.loss_lambda_action = float(loss_lambda_action)
+        self.video_fps = float(video_fps)
+        self.action_fps = float(action_fps)
+        self.freeze_video_expert = bool(freeze_video_expert)
+
+        self.train_video_scheduler = WanContinuousFlowMatchScheduler(
+            num_train_timesteps=video_num_train_timesteps,
+            shift=video_train_shift,
+        )
+        self.infer_video_scheduler = WanContinuousFlowMatchScheduler(
+            num_train_timesteps=video_num_train_timesteps,
+            shift=video_infer_shift,
         )
         self.train_action_scheduler = WanContinuousFlowMatchScheduler(
             num_train_timesteps=action_num_train_timesteps,
@@ -66,10 +87,12 @@ class FastWAMH3(nn.Module):
             num_train_timesteps=action_num_train_timesteps,
             shift=action_infer_shift,
         )
-        self.loss_lambda_action = float(loss_lambda_action)
 
-        self.video_expert.requires_grad_(False).eval()
         self.vae.requires_grad_(False).eval()
+        if self.text_conditioner is not None:
+            self.text_conditioner.requires_grad_(False).eval()
+        self.video_expert.requires_grad_(not self.freeze_video_expert)
+        self.video_expert.eval() if self.freeze_video_expert else self.video_expert.train()
         self.action_expert.to(device=self.device, dtype=self.torch_dtype)
 
     @classmethod
@@ -81,13 +104,21 @@ class FastWAMH3(nn.Module):
         action_dit_config: dict[str, Any],
         action_dit_pretrained_path: str | Path | None,
         skip_dit_load_from_pretrain: bool,
-        proprio_dim: int | None,
+        load_text_encoder: bool,
         device: str | torch.device,
         torch_dtype: torch.dtype,
+        video_train_shift: float,
+        video_infer_shift: float,
+        video_num_train_timesteps: int,
         action_train_shift: float,
         action_infer_shift: float,
         action_num_train_timesteps: int,
+        keyframe_condition_strength: float,
+        loss_lambda_video: float,
         loss_lambda_action: float,
+        video_fps: float,
+        action_fps: float,
+        freeze_video_expert: bool,
     ) -> "FastWAMH3":
         model_path = Path(model_path)
         video_expert = load_h3_video_backbone(
@@ -95,7 +126,7 @@ class FastWAMH3(nn.Module):
             device=device,
             dtype=torch_dtype,
             video_attention_mask_mode=video_dit_config.get(
-                "video_attention_mask_mode", "first_frame_causal"
+                "video_attention_mask_mode", "bidirectional"
             ),
         )
         action_expert = H3ActionDiT.from_pretrained(
@@ -105,275 +136,391 @@ class FastWAMH3(nn.Module):
             device=device,
             dtype=torch_dtype,
         )
-        if action_expert.num_layers != video_expert.num_layers:
-            raise ValueError("H3 action and video experts must have the same layer count.")
-        if action_expert.num_heads != video_expert.num_heads:
-            raise ValueError("H3 action and video experts must have the same head count.")
-        if action_expert.attn_head_dim != video_expert.attn_head_dim:
-            raise ValueError("H3 action and video experts must have the same head dimension.")
         vae = MiniMaxH3VAEAdapter(
             model_path / "video_vae", device=device, dtype=torch_dtype
+        )
+        text_conditioner = (
+            MiniMaxH3TextConditioner.from_pretrained(
+                model_path, device=device, dtype=torch_dtype
+            )
+            if load_text_encoder
+            else None
         )
         return cls(
             video_expert=video_expert,
             action_expert=action_expert,
             vae=vae,
-            proprio_dim=proprio_dim,
-            context_dim=int(action_dit_config.get("context_dim", 4096)),
+            text_conditioner=text_conditioner,
             device=device,
             torch_dtype=torch_dtype,
+            video_train_shift=video_train_shift,
+            video_infer_shift=video_infer_shift,
+            video_num_train_timesteps=video_num_train_timesteps,
             action_train_shift=action_train_shift,
             action_infer_shift=action_infer_shift,
             action_num_train_timesteps=action_num_train_timesteps,
+            keyframe_condition_strength=keyframe_condition_strength,
+            loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            video_fps=video_fps,
+            action_fps=action_fps,
+            freeze_video_expert=freeze_video_expert,
         )
 
     def trainable_modules(self) -> list[nn.Module]:
         modules: list[nn.Module] = [self.action_expert]
-        if self.proprio_encoder is not None:
-            modules.append(self.proprio_encoder)
+        if not self.freeze_video_expert:
+            modules.append(self.video_expert)
         return modules
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.video_expert.eval()
         self.vae.eval()
+        if self.text_conditioner is not None:
+            self.text_conditioner.eval()
+        if self.freeze_video_expert:
+            self.video_expert.eval()
         return self
 
-    def _append_proprio(
+    @staticmethod
+    def _normalize_batch_mask(
+        mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        length: int,
+        name: str,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if mask is None:
+            return torch.zeros((batch_size, length), dtype=torch.bool, device=device)
+        mask = mask.to(device=device, dtype=torch.bool)
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0).expand(batch_size, -1)
+        if mask.shape != (batch_size, length):
+            raise ValueError(
+                f"{name} must be [B,{length}] or [{length}], got {tuple(mask.shape)}"
+            )
+        return mask
+
+    @staticmethod
+    def _tensor_images_to_pil(images: torch.Tensor) -> list[Image.Image]:
+        output: list[Image.Image] = []
+        for image in images:
+            array = (
+                ((image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5)
+                .byte()
+                .permute(1, 2, 0)
+                .numpy()
+            )
+            output.append(Image.fromarray(array))
+        return output
+
+    @staticmethod
+    def _dense_text_batch(
+        batch: H3TextConditionBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lengths = batch.lengths
+        batch_size = len(lengths)
+        max_length = max(lengths)
+        embeddings = batch.embeddings.new_zeros(
+            (batch_size, max_length, batch.embeddings.shape[-1])
+        )
+        tags = torch.zeros(
+            (batch_size, max_length),
+            dtype=torch.long,
+            device=batch.embeddings.device,
+        )
+        valid = torch.zeros(
+            (batch_size, max_length),
+            dtype=torch.bool,
+            device=batch.embeddings.device,
+        )
+        for index, (start, end) in enumerate(
+            zip(batch.cu_seqlens[:-1].tolist(), batch.cu_seqlens[1:].tolist())
+        ):
+            length = int(end - start)
+            embeddings[index, :length] = batch.embeddings[start:end]
+            tags[index, :length] = batch.token_tags[start:end]
+            valid[index, :length] = True
+        return embeddings, tags, valid
+
+    def _prepare_text_condition(
         self,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
-        proprio: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.proprio_encoder is None:
-            return context, context_mask
+        sample: dict[str, Any],
+        first_frame: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        embeddings = sample.get("prompt_embeds")
+        if embeddings is None and sample.get("context") is not None:
+            embeddings = sample["context"]
+        if embeddings is not None:
+            if embeddings.ndim == 2:
+                embeddings = embeddings.unsqueeze(0)
+            if embeddings.ndim != 3 or embeddings.shape[-1] != 5120:
+                raise ValueError(
+                    "Precomputed H3 Qwen embeddings must be [B,L,5120]; "
+                    "legacy Wan/T5 context width is not accepted"
+                )
+            tags = sample.get("prompt_token_tags")
+            valid = sample.get("prompt_attention_mask")
+            if tags is None or valid is None:
+                raise ValueError(
+                    "prompt_token_tags and prompt_attention_mask are required with "
+                    "precomputed H3 Qwen embeddings"
+                )
+            embeddings = embeddings.to(device=self.device, dtype=self.torch_dtype)
+            tags = tags.to(device=self.device, dtype=torch.long)
+            valid = valid.to(device=self.device, dtype=torch.bool)
+            if tags.shape != embeddings.shape[:2] or valid.shape != embeddings.shape[:2]:
+                raise ValueError("Qwen tags/mask must match prompt_embeds [B,L]")
+            valid_tags = tags[valid]
+            if not torch.logical_or(valid_tags == 0, valid_tags == 1).all():
+                raise ValueError("valid Qwen tags must contain only video 0 or text 1")
+            return embeddings, tags, valid
+
+        if self.text_conditioner is None:
+            raise ValueError(
+                "Either native prompt_embeds/tags/mask or a loaded H3 Qwen3-VL "
+                "text conditioner is required"
+            )
+        instructions = sample.get("instruction", sample.get("prompt"))
+        if isinstance(instructions, str):
+            instructions = [instructions]
+        if not isinstance(instructions, Sequence) or len(instructions) != first_frame.shape[0]:
+            raise ValueError("instruction/prompt must contain one string per sample")
+        batch = self.text_conditioner.encode(
+            self._tensor_images_to_pil(first_frame), list(instructions)
+        )
+        return self._dense_text_batch(batch)
+
+    def _prepare_state(self, sample: dict[str, Any], batch_size: int) -> torch.Tensor:
+        proprio = sample.get("proprio")
         if proprio is None:
-            raise ValueError("proprio is required when proprio_dim is configured.")
-        if proprio.ndim != 2 or proprio.shape[-1] != self.proprio_dim:
+            raise ValueError("proprio state is required for FastWAM-H3")
+        if proprio.ndim == 2:
+            proprio = proprio.unsqueeze(1)
+        if proprio.ndim != 3 or proprio.shape[0] != batch_size:
+            raise ValueError("proprio must be [B,T,Ds]")
+        if proprio.shape[-1] != self.action_expert.state_dim:
             raise ValueError(
-                f"proprio must be [B,{self.proprio_dim}], got {tuple(proprio.shape)}"
+                f"proprio state width must be {self.action_expert.state_dim}, got "
+                f"{proprio.shape[-1]}"
             )
-        token = self.proprio_encoder(
-            proprio.to(device=self.device, dtype=self.torch_dtype)
-        ).unsqueeze(1)
-        mask = torch.ones(
-            (context.shape[0], 1), dtype=torch.bool, device=context_mask.device
-        )
-        return torch.cat((context, token), dim=1), torch.cat((context_mask, mask), dim=1)
-
-    @torch.no_grad()
-    def _encode_current_frame(self, image: torch.Tensor) -> torch.Tensor:
-        return self.vae.encode_image(
-            image.to(device=self.device, dtype=self.torch_dtype),
+        state_is_pad = self._normalize_batch_mask(
+            sample.get("proprio_is_pad"),
+            batch_size=batch_size,
+            length=proprio.shape[1],
+            name="proprio_is_pad",
             device=self.device,
-        ).to(dtype=self.torch_dtype)
-
-    @torch.no_grad()
-    def _video_cache(self, image: torch.Tensor) -> dict[str, Any]:
-        latents = self._encode_current_frame(image)
-        timestep = torch.zeros(
-            (latents.shape[0],), device=self.device, dtype=self.torch_dtype
         )
-        return self.video_expert.prefill(latents, timestep)
+        if state_is_pad[:, 0].any():
+            raise ValueError("state aligned with f0 cannot be padded")
+        state = proprio[:, 0].to(device=self.device, dtype=self.torch_dtype)
+        dim_is_pad = self._normalize_batch_mask(
+            sample.get("proprio_dim_is_pad"),
+            batch_size=batch_size,
+            length=state.shape[-1],
+            name="proprio_dim_is_pad",
+            device=self.device,
+        )
+        return state.masked_fill(dim_is_pad, 0.0)
 
-    def _prepare_training_inputs(self, sample: dict[str, Any]) -> dict[str, Any]:
-        video = sample["video"]
-        action = sample["action"]
-        context = sample.get("context")
-        context_mask = sample.get("context_mask")
-        if video.ndim != 5 or video.shape[1] != 3:
-            raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
-        if action.ndim != 3 or action.shape[-1] != self.action_expert.action_dim:
-            raise ValueError(
-                f"action must be [B,T,{self.action_expert.action_dim}], "
-                f"got {tuple(action.shape)}"
-            )
-        if context is None or context_mask is None:
-            raise ValueError("H3 FastWAM requires precomputed context/context_mask.")
-        if context.ndim != 3 or context.shape[-1] != self.context_dim:
-            raise ValueError(
-                f"context must be [B,L,{self.context_dim}], got {tuple(context.shape)}"
-            )
-        context = context.to(
+    def training_loss(
+        self,
+        sample: dict[str, Any],
+        tiled: bool = False,
+        *,
+        base_progress: torch.Tensor | None = None,
+        video_noise: torch.Tensor | None = None,
+        action_noise: torch.Tensor | None = None,
+        keyframe_noise: torch.Tensor | None = None,
+    ):
+        del tiled
+        video = sample["video"].to(
             device=self.device, dtype=self.torch_dtype, non_blocking=True
         )
-        context_mask = context_mask.to(
-            device=self.device, dtype=torch.bool, non_blocking=True
+        action = sample["action"].to(
+            device=self.device, dtype=self.torch_dtype, non_blocking=True
         )
-        proprio = sample.get("proprio")
-        if proprio is not None:
-            proprio = proprio[:, 0].to(
-                device=self.device, dtype=self.torch_dtype, non_blocking=True
-            )
-        context, context_mask = self._append_proprio(
-            context, context_mask, proprio
-        )
-        return {
-            "image": video[:, :, 0].to(
-                device=self.device, dtype=self.torch_dtype, non_blocking=True
-            ),
-            "action": action.to(
-                device=self.device, dtype=self.torch_dtype, non_blocking=True
-            ),
-            "action_is_pad": (
-                None
-                if sample.get("action_is_pad") is None
-                else sample["action_is_pad"].to(
-                    device=self.device, dtype=torch.bool, non_blocking=True
-                )
-            ),
-            "context": context,
-            "context_mask": context_mask,
-        }
-
-    def training_loss(self, sample: dict[str, Any], tiled: bool = False):
-        del tiled
-        inputs = self._prepare_training_inputs(sample)
-        action = inputs["action"]
-        batch_size = action.shape[0]
-        with torch.no_grad():
-            cache = self._video_cache(inputs["image"])
-
-        noise = torch.randn_like(action)
-        timestep = self.train_action_scheduler.sample_training_t(
-            batch_size, self.device, action.dtype
-        )
-        noisy_action = self.train_action_scheduler.add_noise(action, noise, timestep)
-        target = self.train_action_scheduler.training_target(action, noise, timestep)
-        prediction = self.action_expert.forward_with_video_cache(
-            noisy_action,
-            timestep,
-            inputs["context"],
-            inputs["context_mask"],
-            cache["kv_cache"],
-            int(cache["meta"]["tokens_per_frame"]),
-        )
-        token_loss = F.mse_loss(
-            prediction.float(), target.float(), reduction="none"
-        ).mean(dim=-1)
-        action_is_pad = inputs["action_is_pad"]
-        if action_is_pad is not None:
-            valid = (~action_is_pad).to(token_loss.dtype)
-            per_sample = (token_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp(1)
-        else:
-            per_sample = token_loss.mean(dim=1)
-        weight = self.train_action_scheduler.training_weight(timestep).to(
-            device=per_sample.device, dtype=per_sample.dtype
-        )
-        loss_action = (per_sample * weight).mean()
-        loss = self.loss_lambda_action * loss_action
-        return loss, {
-            "loss_action": self.loss_lambda_action * float(loss_action.detach()),
-            "loss_video": 0.0,
-        }
-
-    @torch.no_grad()
-    def infer_action(
-        self,
-        *,
-        input_image: torch.Tensor,
-        action_horizon: int,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
-        proprio: torch.Tensor | None = None,
-        num_inference_steps: int = 20,
-        sigma_shift: float | None = None,
-        seed: int | None = None,
-        rand_device: str = "cpu",
-        **_: Any,
-    ) -> dict[str, torch.Tensor]:
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        context = context.unsqueeze(0) if context.ndim == 2 else context
-        context_mask = (
-            context_mask.unsqueeze(0) if context_mask.ndim == 1 else context_mask
-        )
-        context = context.to(device=self.device, dtype=self.torch_dtype)
-        context_mask = context_mask.to(device=self.device, dtype=torch.bool)
-        if proprio is not None and proprio.ndim == 1:
-            proprio = proprio.unsqueeze(0)
-        context, context_mask = self._append_proprio(
-            context,
-            context_mask,
-            None if proprio is None else proprio.to(self.device),
-        )
-        cache = self._video_cache(
-            input_image.to(device=self.device, dtype=self.torch_dtype)
-        )
-        generator = (
-            None
-            if seed is None
-            else torch.Generator(device=rand_device).manual_seed(seed)
-        )
-        action = torch.randn(
-            (input_image.shape[0], action_horizon, self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
-        timesteps, deltas = self.infer_action_scheduler.build_inference_schedule(
-            num_inference_steps,
-            self.device,
-            action.dtype,
-            shift_override=sigma_shift,
-        )
-        for timestep, delta in zip(timesteps, deltas):
-            step = timestep.expand(action.shape[0])
-            prediction = self.action_expert.forward_with_video_cache(
-                action,
-                step,
-                context,
-                context_mask,
-                cache["kv_cache"],
-                int(cache["meta"]["tokens_per_frame"]),
-            )
-            action = self.infer_action_scheduler.step(prediction, delta, action)
-        return {"action": action[0].float().cpu()}
-
-    @torch.no_grad()
-    def infer(
-        self,
-        *,
-        input_image: torch.Tensor,
-        num_frames: int,
-        action_horizon: int,
-        context: torch.Tensor | None = None,
-        context_mask: torch.Tensor | None = None,
-        prompt: str | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        if context is None or context_mask is None:
+        if video.ndim != 5 or video.shape[1] != 3:
+            raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
+        if video.shape[2] % 17 != 5:
+            raise ValueError(f"H3 video frame count must be 5+17k, got {video.shape[2]}")
+        if video.shape[-2] % 32 or video.shape[-1] % 32:
+            raise ValueError("H3 video height and width must be divisible by 32")
+        if action.ndim != 3 or action.shape[-1] != self.action_expert.action_dim:
             raise ValueError(
-                "H3 FastWAM currently requires precomputed context; prompt-only "
-                "inference is not supported."
+                f"action must be [B,N,{self.action_expert.action_dim}], got "
+                f"{tuple(action.shape)}"
             )
-        action = self.infer_action(
-            input_image=input_image,
-            action_horizon=int(action_horizon),
-            context=context,
-            context_mask=context_mask,
-            **kwargs,
-        )["action"]
-        image = input_image[0] if input_image.ndim == 4 else input_image
-        array = (
-            ((image.detach().float().cpu().clamp(-1, 1) + 1) * 127.5)
-            .byte()
-            .permute(1, 2, 0)
-            .numpy()
+        batch_size = video.shape[0]
+        if action.shape[0] != batch_size:
+            raise ValueError("video and action batch sizes must match")
+        image_is_pad = sample.get("image_is_pad")
+        if image_is_pad is not None and image_is_pad.to(torch.bool).any():
+            raise ValueError("Scheme A does not train video loss on padded frames")
+
+        first_frame = video[:, :, 0]
+        qwen_embeddings, qwen_tags, qwen_valid = self._prepare_text_condition(
+            sample, first_frame
         )
-        frame = Image.fromarray(array)
-        return {"video": [frame.copy() for _ in range(num_frames)], "action": action}
+        state = self._prepare_state(sample, batch_size)
+
+        with torch.no_grad():
+            clean_video = self.vae.encode_video(
+                video, device=self.device, process_image=False
+            ).to(dtype=self.torch_dtype)
+            clean_keyframe = self.vae.encode_video(
+                first_frame.unsqueeze(2),
+                device=self.device,
+                process_image=True,
+            ).to(dtype=self.torch_dtype)
+
+        if base_progress is None:
+            base_progress = torch.rand(
+                batch_size, device=self.device, dtype=torch.float32
+            )
+        else:
+            base_progress = base_progress.to(device=self.device, dtype=torch.float32)
+            if base_progress.shape != (batch_size,):
+                raise ValueError(f"base_progress must be [{batch_size}]")
+        video_timestep = self.train_video_scheduler.timestep_from_progress(
+            base_progress, dtype=self.torch_dtype
+        )
+        action_timestep = self.train_action_scheduler.timestep_from_progress(
+            base_progress, dtype=self.torch_dtype
+        )
+
+        video_noise = (
+            torch.randn_like(clean_video)
+            if video_noise is None
+            else video_noise.to(device=self.device, dtype=self.torch_dtype)
+        )
+        action_noise = (
+            torch.randn_like(action)
+            if action_noise is None
+            else action_noise.to(device=self.device, dtype=self.torch_dtype)
+        )
+        keyframe_noise = (
+            torch.randn_like(clean_keyframe)
+            if keyframe_noise is None
+            else keyframe_noise.to(device=self.device, dtype=self.torch_dtype)
+        )
+        if video_noise.shape != clean_video.shape:
+            raise ValueError("video_noise must match the complete video latent shape")
+        if action_noise.shape != action.shape:
+            raise ValueError("action_noise must match action")
+        if keyframe_noise.shape != clean_keyframe.shape:
+            raise ValueError("keyframe_noise must match the image latent shape")
+
+        noisy_video = self.train_video_scheduler.add_noise(
+            clean_video, video_noise, video_timestep
+        )
+        noisy_action = self.train_action_scheduler.add_noise(
+            action, action_noise, action_timestep
+        )
+        keyframe_condition = augment_keyframe_latents(
+            clean_keyframe,
+            keyframe_noise,
+            strength=self.keyframe_condition_strength,
+        )
+        video_target = self.train_video_scheduler.training_target(
+            clean_video, video_noise, video_timestep
+        )
+        action_target = self.train_action_scheduler.training_target(
+            action, action_noise, action_timestep
+        )
+
+        action_is_pad = self._normalize_batch_mask(
+            sample.get("action_is_pad"),
+            batch_size=batch_size,
+            length=action.shape[1],
+            name="action_is_pad",
+            device=self.device,
+        )
+        action_dim_is_pad = self._normalize_batch_mask(
+            sample.get("action_dim_is_pad"),
+            batch_size=batch_size,
+            length=action.shape[2],
+            name="action_dim_is_pad",
+            device=self.device,
+        )
+        action_valid = ~action_is_pad
+
+        predictions = self.video_expert.forward_joint(
+            action_expert=self.action_expert,
+            qwen_embeddings=qwen_embeddings,
+            qwen_tags=qwen_tags,
+            qwen_valid=qwen_valid,
+            clean_keyframe_latents=keyframe_condition,
+            noisy_video_latents=noisy_video,
+            video_timestep=video_timestep,
+            noisy_action_tokens=noisy_action,
+            action_timestep=action_timestep,
+            state_tokens=state,
+            action_valid=action_valid,
+            keyframe_condition_strength=self.keyframe_condition_strength,
+            video_fps=self.video_fps,
+            action_fps=self.action_fps,
+            video_timestep_scale=float(
+                self.train_video_scheduler.num_train_timesteps
+            ),
+        )
+        video_prediction = predictions["video_prediction"]
+        action_prediction = predictions["action_prediction"]
+        if video_prediction.shape != video_target.shape:
+            raise ValueError("video prediction must cover every full-video latent")
+        if action_prediction.shape != action_target.shape:
+            raise ValueError("action prediction must cover only action target rows")
+
+        video_element_loss = F.mse_loss(
+            video_prediction.float(), video_target.float(), reduction="none"
+        )
+        video_per_sample = video_element_loss.flatten(1).mean(dim=1)
+        video_weight = self.train_video_scheduler.training_weight(video_timestep)
+        loss_video = (video_per_sample * video_weight.float()).mean()
+
+        action_element_loss = F.mse_loss(
+            action_prediction.float(), action_target.float(), reduction="none"
+        )
+        action_element_valid = (
+            action_valid.unsqueeze(-1) & ~action_dim_is_pad.unsqueeze(1)
+        )
+        action_per_sample = (
+            (action_element_loss * action_element_valid).flatten(1).sum(dim=1)
+            / action_element_valid.flatten(1).sum(dim=1).clamp(min=1)
+        )
+        action_weight = self.train_action_scheduler.training_weight(action_timestep)
+        loss_action = (action_per_sample * action_weight.float()).mean()
+
+        loss = (
+            self.loss_lambda_video * loss_video
+            + self.loss_lambda_action * loss_action
+        )
+        sigma_video = video_timestep.float() / float(
+            self.train_video_scheduler.num_train_timesteps
+        )
+        sigma_action = action_timestep.float() / float(
+            self.train_action_scheduler.num_train_timesteps
+        )
+        return loss, {
+            "loss_video": float(loss_video.detach()),
+            "loss_action": float(loss_action.detach()),
+            "base_progress_mean": float(base_progress.mean()),
+            "sigma_video_mean": float(sigma_video.mean()),
+            "sigma_action_mean": float(sigma_action.mean()),
+        }
 
     @torch.no_grad()
     def _encode_video_latents(self, video: torch.Tensor, **_: Any) -> torch.Tensor:
-        return self.vae.encode(video, device=self.device).to(dtype=self.torch_dtype)
+        return self.vae.encode_video(
+            video, device=self.device, process_image=False
+        ).to(dtype=self.torch_dtype)
 
     @torch.no_grad()
     def _decode_latents(self, latents: torch.Tensor, **_: Any) -> list[Image.Image]:
         decoded = self.vae.decode(latents, device=self.device)
         decoded = decoded[0].detach().float().cpu().clamp(-1, 1)
-        frames = []
+        frames: list[Image.Image] = []
         for index in range(decoded.shape[1]):
             array = (
                 ((decoded[:, index] + 1) * 127.5)
@@ -386,21 +533,24 @@ class FastWAMH3(nn.Module):
 
     def save_checkpoint(self, path: str | Path, optimizer=None, step=None):
         payload = {
+            "schema_version": 2,
             "action_expert": self.action_expert.state_dict(),
             "step": step,
-            "backbone": "MiniMax-H3-FL2VA",
+            "backbone": "MiniMax-H3-FL2VA-Scheme-A",
         }
-        if self.proprio_encoder is not None:
-            payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if not self.freeze_video_expert:
+            payload["video_expert"] = self.video_expert.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
     def load_checkpoint(self, path: str | Path, optimizer=None):
         payload = torch.load(path, map_location="cpu", weights_only=False)
+        if payload.get("schema_version") != 2:
+            raise ValueError("Checkpoint is not a FastWAM-H3 Scheme A checkpoint")
         self.action_expert.load_state_dict(payload["action_expert"], strict=True)
-        if self.proprio_encoder is not None and "proprio_encoder" in payload:
-            self.proprio_encoder.load_state_dict(payload["proprio_encoder"])
+        if "video_expert" in payload:
+            self.video_expert.load_state_dict(payload["video_expert"], strict=True)
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
         return payload

@@ -257,32 +257,32 @@
 - Produces: FastWAMH3.prepare_conditions(), prepare_noisy_targets(), training_loss().
 - Consumes: video, instruction or precomputed Qwen condition, proprio masks, action masks, two schedulers.
 
-- [ ] **Step 1: Write failing end-to-end contract tests with tiny fakes**
+- [x] **Step 1: Write failing end-to-end contract tests with tiny fakes**
 
   Tests inject tiny deterministic VAE/text/video/action components and assert:
   full video is encoded once; image is encoded separately; all video latent
   positions have loss; state has no loss; action_dim_is_pad and action_is_pad
   remove elements; the same base progress creates separate video/action sigma.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_training_contract.py -q
 
-- [ ] **Step 3: Implement condition and target preparation**
+- [x] **Step 3: Implement condition and target preparation**
 
   prepare_conditions obtains Qwen rows/tags, image latent, 0.999 augmentation,
   and aligned normalized state. prepare_noisy_targets encodes complete video once,
   samples one base progress, maps it through both shifts, and noises full-video
   and action targets independently.
 
-- [ ] **Step 4: Implement explicit masked losses**
+- [x] **Step 4: Implement explicit masked losses**
 
   video prediction is gathered only at video_target_indices and compared to
   epsilon_video-clean_video. Action prediction contains only action rows and is
   masked by time and dimension masks. Both denominators clamp at one and metrics
   report unweighted loss_video/loss_action plus total loss.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_training_contract.py -q
     git add src/fastwam/models/minimax_h3/fastwam.py tests/models/minimax_h3/test_training_contract.py
