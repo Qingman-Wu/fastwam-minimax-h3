@@ -14,6 +14,7 @@ from hydra.utils import instantiate
 from .base_lerobot_dataset import BaseLerobotDataset
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
+from ..padding import fetch_unpadded_temporal_sample
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
 from accelerate import PartialState
@@ -113,29 +114,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return len(self.lerobot_dataset)
 
     def _get(self, idx):
-        sample_idx = idx
-        sample = None
-        for attempt in range(self.max_padding_retry + 1):
-            sample = self.lerobot_dataset[sample_idx]
-
-            if not self.skip_padding_as_possible:
-                break
-
-            action_is_pad = sample["action_is_pad"]
-            image_is_pad = sample["image_is_pad"]
-            proprio_is_pad = sample["proprio_is_pad"]
-            has_pad = False
-            if bool(action_is_pad.any().item()):
-                has_pad = True
-            if bool(image_is_pad.any().item()):
-                has_pad = True
-            if bool(proprio_is_pad.any().item()):
-                has_pad = True
-
-            if not has_pad or attempt >= self.max_padding_retry:
-                break
-
-            sample_idx = np.random.randint(len(self.lerobot_dataset))
+        if self.skip_padding_as_possible:
+            sample = fetch_unpadded_temporal_sample(
+                self.lerobot_dataset.__getitem__,
+                initial_index=idx,
+                dataset_size=len(self.lerobot_dataset),
+                max_retries=self.max_padding_retry,
+                random_index=np.random.randint,
+            )
+        else:
+            sample = self.lerobot_dataset[idx]
         
         image_is_pad = sample["image_is_pad"]
 

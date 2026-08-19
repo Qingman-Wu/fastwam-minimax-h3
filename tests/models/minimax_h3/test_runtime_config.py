@@ -116,6 +116,7 @@ def test_h3_task_uses_native_prompt_path_and_no_t5_cache():
     data_config = OmegaConf.load(ROOT / "configs/data/libero_2cam.yaml")
 
     assert config.data.train.text_embedding_cache_dir is None
+    assert config.data.train.max_padding_retry == 50
     assert data_config.train.num_frames == 33
     assert config.data.train.action_video_freq_ratio == 8
 
