@@ -374,31 +374,34 @@
 - Consumes: complete repository and target GitHub branch.
 - Produces: clean test output, CUDA smoke result, and pushed commits.
 
-- [ ] **Step 1: Run local CPU suite**
+- [x] **Step 1: Run local dependency-light CPU tests and compile checks**
 
-    .venv/bin/python -m pytest tests/models/minimax_h3 -q
-    .venv/bin/python -m compileall -q src scripts tests
+    PYTHONPATH=src .venv/bin/python -m pytest \
+      tests/models/minimax_h3/test_conditioning.py \
+      tests/models/minimax_h3/test_condition_cache.py \
+      tests/models/minimax_h3/test_dataset_padding.py -q
+    /opt/homebrew/bin/python3.12 -m compileall -q src scripts tests
 
 - [ ] **Step 2: Push the reviewed branch commits**
 
     git push minimax-h3 codex/fastwam-h3-scheme-a-2026-08-19
 
-- [ ] **Step 3: Update the RTX 5090 checkout**
+- [x] **Step 3: Update the RTX 5090 checkout**
 
     ssh rtx5090-180 'git -C /root/codex-workspaces/fastwam-h3-scheme-a-2026-08-19 pull --ff-only'
 
-- [ ] **Step 4: Build the remote test environment and run CPU tests**
+- [x] **Step 4: Use the remote PyTorch environment and run CPU tests**
 
-    ssh rtx5090-180 'cd /root/codex-workspaces/fastwam-h3-scheme-a-2026-08-19 && uv venv --python 3.10 .venv && uv pip install --python .venv/bin/python -e . pytest && .venv/bin/python -m pytest tests/models/minimax_h3 -q'
+    ssh rtx5090-180 'cd /root/codex-workspaces/fastwam-h3-scheme-a-2026-08-19 && PYTHONPATH=src /home/work/wenjj/RoboLab/.venv/bin/python -m pytest tests -q'
 
-- [ ] **Step 5: Run a small CUDA smoke test on an idle GPU**
+- [x] **Step 5: Run a small CUDA smoke test on an idle GPU**
 
   Instantiate one-layer tiny H3/Action experts in bf16, run forward/backward for
   batch two with unequal valid lengths, assert finite video/action gradients,
   and record peak allocated memory. Do not start the full 33B model until an
   idle multi-GPU allocation and actual FL2VA path are confirmed.
 
-- [ ] **Step 6: Final mutation and spec coverage check**
+- [x] **Step 6: Final mutation and spec coverage check**
 
   Mutate each mask/visibility boundary mentally and confirm at least one test
   fails: keyframe in loss, first video latent omitted, state output included,
