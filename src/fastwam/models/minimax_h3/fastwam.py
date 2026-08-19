@@ -518,7 +518,12 @@ class FastWAMH3(nn.Module):
 
     @torch.no_grad()
     def _decode_latents(self, latents: torch.Tensor, **_: Any) -> list[Image.Image]:
-        decoded = self.vae.decode(latents, device=self.device)
+        frame_num = _.get("frame_num")
+        decoded = self.vae.decode(
+            latents,
+            device=self.device,
+            frame_num=None if frame_num is None else int(frame_num),
+        )
         decoded = decoded[0].detach().float().cpu().clamp(-1, 1)
         frames: list[Image.Image] = []
         for index in range(decoded.shape[1]):
@@ -530,6 +535,214 @@ class FastWAMH3(nn.Module):
             )
             frames.append(Image.fromarray(array))
         return frames
+
+    @torch.no_grad()
+    def infer(
+        self,
+        *,
+        input_image: torch.Tensor,
+        num_frames: int,
+        action_horizon: int,
+        proprio: torch.Tensor,
+        prompt: str | Sequence[str] | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_token_tags: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+        proprio_dim_is_pad: torch.Tensor | None = None,
+        action: torch.Tensor | None = None,
+        negative_prompt: str | None = None,
+        text_cfg_scale: float = 1.0,
+        action_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: float | None = None,
+        action_sigma_shift: float | None = None,
+        seed: int | None = None,
+        rand_device: str | torch.device = "cpu",
+        tiled: bool = False,
+        video_noise: torch.Tensor | None = None,
+        action_noise: torch.Tensor | None = None,
+        keyframe_noise: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Jointly sample a complete H3 video target and an action trajectory."""
+
+        del negative_prompt, text_cfg_scale, action_cfg_scale, tiled
+        if action is not None:
+            raise ValueError(
+                "FastWAM-H3 inference does not accept ground-truth action conditioning"
+            )
+        if input_image.ndim == 3:
+            input_image = input_image.unsqueeze(0)
+        if (
+            input_image.ndim != 4
+            or input_image.shape[0] != 1
+            or input_image.shape[1] != 3
+        ):
+            raise ValueError(
+                "input_image must be [1,3,H,W] or [3,H,W] for H3 inference"
+            )
+        batch_size, _, height, width = input_image.shape
+        num_frames = int(num_frames)
+        action_horizon = int(action_horizon)
+        if num_frames < 5 or num_frames % 17 != 5:
+            raise ValueError(f"H3 num_frames must be 5+17k, got {num_frames}")
+        if height % 32 or width % 32:
+            raise ValueError("H3 input height and width must be divisible by 32")
+        if action_horizon <= 0:
+            raise ValueError("action_horizon must be positive")
+
+        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        if proprio.ndim == 1:
+            proprio = proprio.view(1, 1, -1)
+        elif proprio.ndim == 2:
+            proprio = proprio.unsqueeze(1)
+        infer_sample: dict[str, Any] = {
+            "proprio": proprio,
+            "proprio_dim_is_pad": proprio_dim_is_pad,
+        }
+        if prompt_embeds is not None:
+            infer_sample.update(
+                {
+                    "prompt_embeds": prompt_embeds,
+                    "prompt_token_tags": prompt_token_tags,
+                    "prompt_attention_mask": prompt_attention_mask,
+                }
+            )
+        elif context is not None:
+            infer_sample.update(
+                {
+                    "context": context,
+                    "prompt_token_tags": prompt_token_tags,
+                    "prompt_attention_mask": (
+                        prompt_attention_mask
+                        if prompt_attention_mask is not None
+                        else context_mask
+                    ),
+                }
+            )
+        else:
+            infer_sample["prompt"] = prompt
+
+        qwen_embeddings, qwen_tags, qwen_valid = self._prepare_text_condition(
+            infer_sample, input_image
+        )
+        state = self._prepare_state(infer_sample, batch_size)
+        clean_keyframe = self.vae.encode_video(
+            input_image.unsqueeze(2),
+            device=self.device,
+            process_image=True,
+        ).to(dtype=self.torch_dtype)
+
+        latent_t = (
+            num_frames - 1
+        ) // int(self.vae.temporal_downsample_factor) + 1
+        latent_h = height // int(self.vae.upsampling_factor)
+        latent_w = width // int(self.vae.upsampling_factor)
+        latent_channels = int(
+            getattr(self.vae, "z_dim", getattr(self.vae.model, "z_dim"))
+        )
+        video_shape = (
+            batch_size,
+            latent_channels,
+            latent_t,
+            latent_h,
+            latent_w,
+        )
+        action_shape = (batch_size, action_horizon, self.action_expert.action_dim)
+        generator = (
+            None
+            if seed is None
+            else torch.Generator(device=rand_device).manual_seed(int(seed))
+        )
+
+        def prepare_noise(
+            supplied: torch.Tensor | None,
+            shape: tuple[int, ...],
+            name: str,
+        ) -> torch.Tensor:
+            if supplied is None:
+                value = torch.randn(
+                    shape,
+                    generator=generator,
+                    device=rand_device,
+                    dtype=torch.float32,
+                )
+            else:
+                if tuple(supplied.shape) != shape:
+                    raise ValueError(f"{name} must have shape {shape}")
+                value = supplied
+            return value.to(device=self.device, dtype=self.torch_dtype)
+
+        latents_video = prepare_noise(video_noise, video_shape, "video_noise")
+        latents_action = prepare_noise(action_noise, action_shape, "action_noise")
+        keyframe_noise = prepare_noise(
+            keyframe_noise, tuple(clean_keyframe.shape), "keyframe_noise"
+        )
+        keyframe_condition = augment_keyframe_latents(
+            clean_keyframe,
+            keyframe_noise,
+            strength=self.keyframe_condition_strength,
+        )
+        action_valid = torch.ones(
+            (batch_size, action_horizon), dtype=torch.bool, device=self.device
+        )
+
+        video_timesteps, video_deltas = (
+            self.infer_video_scheduler.build_inference_schedule(
+                num_inference_steps,
+                self.device,
+                latents_video.dtype,
+                shift_override=sigma_shift,
+            )
+        )
+        action_timesteps, action_deltas = (
+            self.infer_action_scheduler.build_inference_schedule(
+                num_inference_steps,
+                self.device,
+                latents_action.dtype,
+                shift_override=action_sigma_shift,
+            )
+        )
+        if video_timesteps.shape != action_timesteps.shape:
+            raise ValueError("video and action inference schedules must align by step")
+
+        for video_t, video_delta, action_t, action_delta in zip(
+            video_timesteps,
+            video_deltas,
+            action_timesteps,
+            action_deltas,
+        ):
+            predictions = self.video_expert.forward_joint(
+                action_expert=self.action_expert,
+                qwen_embeddings=qwen_embeddings,
+                qwen_tags=qwen_tags,
+                qwen_valid=qwen_valid,
+                clean_keyframe_latents=keyframe_condition,
+                noisy_video_latents=latents_video,
+                video_timestep=video_t.expand(batch_size),
+                noisy_action_tokens=latents_action,
+                action_timestep=action_t.expand(batch_size),
+                state_tokens=state,
+                action_valid=action_valid,
+                keyframe_condition_strength=self.keyframe_condition_strength,
+                video_fps=self.video_fps,
+                action_fps=self.action_fps,
+                video_timestep_scale=float(
+                    self.infer_video_scheduler.num_train_timesteps
+                ),
+            )
+            latents_video = self.infer_video_scheduler.step(
+                predictions["video_prediction"], video_delta, latents_video
+            )
+            latents_action = self.infer_action_scheduler.step(
+                predictions["action_prediction"], action_delta, latents_action
+            )
+
+        return {
+            "video": self._decode_latents(latents_video, frame_num=num_frames),
+            "action": latents_action[0].detach().float().cpu(),
+        }
 
     def save_checkpoint(self, path: str | Path, optimizer=None, step=None):
         payload = {

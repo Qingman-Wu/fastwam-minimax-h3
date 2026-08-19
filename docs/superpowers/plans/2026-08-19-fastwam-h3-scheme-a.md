@@ -298,24 +298,24 @@
 - Produces: FastWAMH3.infer() returning action and decoded auxiliary video.
 - Consumes: f0, instruction/Qwen rows, state, num_frames, action_horizon, two inference schedules.
 
-- [ ] **Step 1: Write failing inference loop tests**
+- [x] **Step 1: Write failing inference loop tests**
 
   Use deterministic fake schedulers and assert every step calls both experts,
   video and action both change, no future ground-truth video is accepted, the
   keyframe/Qwen/state conditions are computed once, and decoded video is not a
   repeated input-frame placeholder.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_inference_contract.py -q
 
-- [ ] **Step 3: Implement synchronized dual-schedule denoising**
+- [x] **Step 3: Implement synchronized dual-schedule denoising**
 
   Initialize complete video and action Gaussian noise. For each shared progress
   index, run the complete aligned H3/Action stack and apply each schedule's own
   sigma delta. Decode the final complete video and denormalize actions.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
     .venv/bin/python -m pytest tests/models/minimax_h3/test_inference_contract.py -q
     git add src/fastwam/models/minimax_h3/fastwam.py tests/models/minimax_h3/test_inference_contract.py
