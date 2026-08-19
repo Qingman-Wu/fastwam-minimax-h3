@@ -104,6 +104,22 @@ def test_action_positions_prefer_explicit_timestamps():
     )
 
 
+def test_32_actions_span_the_same_h3_clock_as_four_visual_transitions():
+    positions = action_mm_position_ids(
+        action_length=32,
+        text_origin=7,
+        video_fps=24.0,
+        action_fps=192.0,
+    )
+
+    assert positions[0, 0] == 7.0
+    assert torch.allclose(
+        positions[-1, 0],
+        torch.tensor(7.0 + (5.0 / 3.0) * (31.0 / 8.0), dtype=torch.float64),
+    )
+    assert positions[-1, 0] < 7.0 + (5.0 / 3.0) * 4.0
+
+
 def test_state_position_is_aligned_with_current_frame():
     assert torch.equal(
         state_mm_position_ids(batch_size=2, text_origin=torch.tensor([3, 9])),

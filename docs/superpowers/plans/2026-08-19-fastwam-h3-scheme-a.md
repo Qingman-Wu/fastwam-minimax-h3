@@ -53,7 +53,7 @@
     def test_action_positions_share_h3_mm_rope_clock():
         pos = action_mm_position_ids(
             action_length=3, text_origin=7,
-            video_fps=24.0, action_fps=8.0,
+            video_fps=24.0, action_fps=192.0,
         )
         assert torch.equal(pos[:, 1:], torch.zeros(3, 2, dtype=pos.dtype))
         assert torch.allclose(pos[:, 0], torch.tensor([7.0, 12.0, 17.0]))

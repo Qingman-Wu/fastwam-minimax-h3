@@ -91,8 +91,11 @@ clean target x0 and noise epsilon:
 Action and state positions use H3 MM-RoPE rather than a standalone 1D RoPE.
 H3 rotates 96 of each 128 head dimensions and passes the remaining 32 through.
 State is located at the current-frame time. Action times are mapped from their
-real timestamps, or from i * video_fps / action_fps when timestamps are absent,
-then scaled by H3's 5/3 temporal position convention.
+real timestamps, or from i * video_fps / action_fps when timestamps are absent.
+For the current 32-action/five-frame clips, eight action rows occupy each
+visual interval, so H3's 24-fps RoPE clock uses an effective action rate of
+192 rather than the physical controller rate. The result is then scaled by
+H3's 5/3 temporal position convention.
 
 ## Losses
 

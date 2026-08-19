@@ -23,6 +23,10 @@ num_workers: 16
 model:
   # The optimized 8xH20 setting has enough memory to avoid recomputation.
   mot_checkpoint_mixed_attn: false
+  # The 32 action rows cover the four transitions of five visual frames.
+  # On H3's native 24-fps RoPE clock, eight controls per visual interval
+  # therefore correspond to an effective action rate of 24 * 8 = 192.
+  action_fps: 192.0
 
 lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
