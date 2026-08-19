@@ -75,6 +75,10 @@ def make_tiny_video_dit():
     ).eval()
 
 
+def test_h3_scheme_a_backbone_defaults_to_bidirectional_attention():
+    assert make_tiny_video_dit().video_attention_mask_mode == "bidirectional"
+
+
 def test_keyframe_augmentation_uses_h3_native_ratio():
     clean = torch.full((1, 24, 1, 2, 2), 2.0)
     noise = torch.full_like(clean, -3.0)

@@ -369,7 +369,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
         norm_eps: float = 1e-5,
         qk_norm_eps: float = 1e-5,
         final_norm_eps: float = 1e-5,
-        video_attention_mask_mode: str = "first_frame_causal",
+        video_attention_mask_mode: str = "bidirectional",
         **_: Any,
     ) -> None:
         super().__init__()
@@ -821,7 +821,7 @@ def load_h3_video_backbone(
     *,
     device: str | torch.device,
     dtype: torch.dtype = torch.bfloat16,
-    video_attention_mask_mode: str = "first_frame_causal",
+    video_attention_mask_mode: str = "bidirectional",
 ) -> MiniMaxH3VideoBackbone:
     """Load only H3 parameters required by the visual FastWAM backbone."""
     transformer_dir = Path(transformer_dir)

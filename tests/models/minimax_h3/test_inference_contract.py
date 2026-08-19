@@ -207,4 +207,3 @@ def test_inference_rejects_ground_truth_action_conditioning():
 
     with pytest.raises(ValueError, match="ground-truth action"):
         model.infer(**kwargs)
-
