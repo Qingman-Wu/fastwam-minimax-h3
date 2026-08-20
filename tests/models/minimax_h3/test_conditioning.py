@@ -39,6 +39,9 @@ class IdentityProcessor:
     def transform_tensor(self, value):
         return value
 
+    def revert_tensor(self, value):
+        return value
+
 
 class TinyImageProcessor:
     merge_size = 1
@@ -67,7 +70,7 @@ class RecordingQwenModel(nn.Module):
             for layer in range(65)
         )
         return SimpleNamespace(
-            last_hidden_state=hidden_states[-1],
+            last_hidden_state=hidden_states[50],
             hidden_states=hidden_states,
         )
 
@@ -82,14 +85,27 @@ class TinyNativeVAE(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
         self.processor = IdentityProcessor()
+        self.tokens_chunk_size = 5
+        self.token_overlap = 2
+        self.decoded_latent_shape = None
 
     def encode_images(self, images, transform_input=False):
         assert transform_input is False
         return [torch.ones(24, 1, 2, 2) for _ in images]
 
-    def encode_videos(self, videos, transform_input=False):
+    def encode_videos(self, videos, transform_input=False, encode_prefix=False):
         assert transform_input is False
-        return [torch.full((24, 2, 2, 2), 2.0) for _ in videos]
+        assert encode_prefix is True
+        return (
+            [torch.full((24, 2, 2, 2), 2.0) for _ in videos],
+            [0] * len(videos),
+        )
+
+    def decode_base(self, latents, frame_num=None):
+        self.decoded_latent_shape = tuple(latents.shape)
+        return torch.zeros(
+            latents.shape[0], 3, frame_num, latents.shape[-2], latents.shape[-1]
+        )
 
 
 def make_tiny_vae_adapter():
@@ -138,9 +154,16 @@ def test_h3_loader_preserves_checkpoint_parameter_dtypes(tmp_path):
         "rope_inv_freq_len": 1,
     }
     source = MiniMaxH3VideoBackbone(**config)
+    fp32_prefixes = (
+        "video_patch_proj.",
+        "time_embedder.",
+        "final_layer.video_out.",
+    )
     state = {
         name: tensor.detach().to(
-            torch.float32 if name == "video_patch_proj.weight" else torch.bfloat16
+            torch.float32
+            if name.startswith(fp32_prefixes)
+            else torch.bfloat16
         ).contiguous()
         for name, tensor in source.state_dict().items()
     }
@@ -157,6 +180,42 @@ def test_h3_loader_preserves_checkpoint_parameter_dtypes(tmp_path):
 
     assert loaded.video_patch_proj.weight.dtype == torch.float32
     assert loaded.condition_proj.weight.dtype == torch.bfloat16
+    patches = loaded.project_video_patches(torch.randn(1, 2, 8, dtype=torch.bfloat16))
+    time = loaded.time_embedder(torch.tensor([500.0]), torch.bfloat16)
+    logits = loaded.final_layer(
+        torch.randn(1, 2, 12, dtype=torch.bfloat16), time
+    )
+    assert patches.dtype == time.dtype == logits.dtype == torch.bfloat16
+
+
+def test_h3_attention_lora_starts_as_noop_and_keeps_base_frozen():
+    torch.manual_seed(11)
+    model = MiniMaxH3VideoBackbone(
+        hidden_size=8,
+        ffn_hidden_size=16,
+        num_layers=1,
+        token_refiner_num_layers=0,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        latents_dim=2,
+        patch_size=(1, 2, 2),
+        text_dim=5,
+        timestep_input_dim=4,
+        time_embed_hidden_size=8,
+        time_embed_dim=8,
+        rope_inv_freq_len=1,
+    )
+    value = torch.randn(2, 3, 8)
+    expected = model.blocks[0].attn.qkv_proj(value)
+
+    model.inject_attention_lora(rank=2, alpha=2.0)
+    actual = model.blocks[0].attn.qkv_proj(value)
+    actual.square().mean().backward()
+
+    assert torch.equal(actual, expected)
+    assert len(model.lora_branches()) == 2
+    assert model.blocks[0].attn.qkv_proj.base.weight.grad is None
+    assert model.blocks[0].attn.qkv_proj.lora.lora_b.weight.grad is not None
 
 
 def test_h3_scheme_a_backbone_defaults_to_bidirectional_attention():
@@ -200,6 +259,18 @@ def test_h3_native_temporal_latent_length(num_frames, latent_frames):
     assert MiniMaxH3VAEAdapter.latent_temporal_length(num_frames) == latent_frames
 
 
+def test_five_frame_decode_pads_to_one_runtime_temporal_window():
+    adapter = make_tiny_vae_adapter()
+
+    decoded = adapter.decode(torch.zeros(1, 24, 2, 2, 2), frame_num=5)
+
+    # This only covers the released decoder's runtime shape requirement. Real
+    # FL2VA gold parity shows that repeating the last latent is not a
+    # semantically correct reconstruction of a five-frame prefix.
+    assert adapter.vae.decoded_latent_shape == (1, 24, 7, 2, 2)
+    assert decoded.shape == (1, 3, 5, 2, 2)
+
+
 @pytest.mark.parametrize("num_frames", [0, 4, 6, 21, 23])
 def test_h3_native_temporal_latent_length_rejects_unsupported_frames(num_frames):
     with pytest.raises(ValueError, match=r"5\+17k"):
@@ -228,7 +299,7 @@ def test_qwen_conditioner_returns_h3_native_layer_50_not_final_layer():
     batch = conditioner.encode([object()], ["go"])
 
     assert torch.equal(batch.embeddings, torch.full_like(batch.embeddings, 50.0))
-    assert model.kwargs["output_hidden_states"] is True
+    assert model.kwargs["output_hidden_states"] is False
 
 
 def test_precomputed_qwen_condition_requires_native_hidden_width_and_tags():

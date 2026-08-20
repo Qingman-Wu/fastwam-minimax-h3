@@ -77,8 +77,12 @@ class H3TimeEmbedder(nn.Module):
             / half
         )
         args = timestep.float()[:, None] * freqs[None]
-        embedding = torch.cat((args.cos(), args.sin()), dim=-1).to(dtype)
-        return self.proj_out(F.silu(self.proj_in(embedding)))
+        embedding = torch.cat((args.cos(), args.sin()), dim=-1).to(
+            self.proj_in.weight.dtype
+        )
+        hidden = self.proj_in(embedding)
+        hidden = F.silu(hidden).to(self.proj_out.weight.dtype)
+        return self.proj_out(hidden).to(dtype)
 
 
 class H3RoPE(nn.Module):
@@ -141,6 +145,65 @@ class H3Attention(nn.Module):
             v.transpose(1, 2),
         ).transpose(1, 2)
         return self.output(attended)
+
+
+class H3LoRABranch(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.scaling = float(alpha) / int(rank)
+        self.dropout = nn.Dropout(float(dropout))
+        self.lora_a = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
+        self.lora_b = nn.Linear(rank, out_features, bias=False, device=device, dtype=dtype)
+        nn.init.kaiming_uniform_(self.lora_a.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_b.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lora_b(self.lora_a(self.dropout(x))) * self.scaling
+
+
+class H3LoRALinear(nn.Module):
+    """Frozen checkpoint linear plus an independently trainable LoRA branch."""
+
+    def __init__(
+        self,
+        base: nn.Linear,
+        *,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.base = base.requires_grad_(False)
+        self.lora = H3LoRABranch(
+            base.in_features,
+            base.out_features,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+            device=base.weight.device,
+            dtype=base.weight.dtype,
+        )
+
+    @property
+    def weight(self) -> nn.Parameter:
+        return self.base.weight
+
+    @property
+    def bias(self) -> nn.Parameter | None:
+        return self.base.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.lora(x)
 
 
 class H3MLP(nn.Module):
@@ -344,7 +407,8 @@ class H3FinalLayer(nn.Module):
             scale = scale[:, None]
         hidden = self.norm(x)
         hidden = hidden * (1 + scale) + shift
-        return self.video_out(hidden)
+        logits = self.video_out(hidden.to(self.video_out.weight.dtype))
+        return logits.to(x.dtype)
 
 
 class MiniMaxH3VideoBackbone(nn.Module):
@@ -422,6 +486,35 @@ class MiniMaxH3VideoBackbone(nn.Module):
             final_norm_eps,
         )
 
+    def inject_attention_lora(
+        self, *, rank: int, alpha: float, dropout: float = 0.0
+    ) -> None:
+        rank = int(rank)
+        if rank <= 0:
+            return
+        for block in self.blocks:
+            if isinstance(block.attn.qkv_proj, H3LoRALinear):
+                raise ValueError("H3 attention LoRA has already been injected")
+            block.attn.qkv_proj = H3LoRALinear(
+                block.attn.qkv_proj,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+            )
+            block.attn.out_proj = H3LoRALinear(
+                block.attn.out_proj,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+            )
+
+    def lora_branches(self) -> list[H3LoRABranch]:
+        return [
+            module.lora
+            for module in self.modules()
+            if isinstance(module, H3LoRALinear)
+        ]
+
     def refine_text_condition(
         self,
         qwen_embeddings: torch.Tensor,
@@ -449,7 +542,18 @@ class MiniMaxH3VideoBackbone(nn.Module):
             or not (cu_seqlens[1:] > cu_seqlens[:-1]).all()
         ):
             raise ValueError("cu_seqlens must delimit every non-empty Qwen sample")
-        return self.token_refiner(self.condition_proj(qwen_embeddings), cu_seqlens)
+        projected = self.condition_proj(
+            qwen_embeddings.to(self.condition_proj.weight.dtype)
+        )
+        return self.token_refiner(projected, cu_seqlens)
+
+    def project_video_patches(self, patches: torch.Tensor) -> torch.Tensor:
+        """Run the checkpoint's FP32 patch projection, then enter H3 BF16."""
+
+        projected = self.video_patch_proj(
+            patches.to(self.video_patch_proj.weight.dtype)
+        )
+        return projected.to(self.condition_proj.weight.dtype)
 
     def forward_joint(
         self,
@@ -521,8 +625,8 @@ class MiniMaxH3VideoBackbone(nn.Module):
         h3_hidden = torch.cat(
             (
                 qwen_hidden,
-                self.video_patch_proj(keyframe_patches),
-                self.video_patch_proj(video_patches),
+                self.project_video_patches(keyframe_patches),
+                self.project_video_patches(video_patches),
             ),
             dim=1,
         )
@@ -795,7 +899,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
         self, latents: torch.Tensor, timestep: torch.Tensor
     ) -> dict[str, Any]:
         patches, meta = self.patchify(latents)
-        x = self.video_patch_proj(patches)
+        x = self.project_video_patches(patches)
         time_embedding = self.time_embedder(timestep, x.dtype)
         rope_freqs = self.rope(self.position_ids(meta, x.device)).to(x.device)
         mask = self.build_video_attention_mask(

@@ -217,3 +217,16 @@ def test_inference_requires_two_or_more_h3_sigma_points():
 
     with pytest.raises(ValueError, match="sigma points"):
         model.infer(**kwargs)
+
+
+def test_evaluator_compatibility_wrappers_reuse_joint_sampler():
+    model = make_model()
+    kwargs = infer_kwargs()
+    kwargs["num_video_frames"] = kwargs.pop("num_frames")
+
+    joint = model.infer_joint(prompt=None, **kwargs)
+    action = model.infer_action(prompt=None, **kwargs)
+
+    assert set(joint) == {"video", "action"}
+    assert set(action) == {"action"}
+    assert torch.equal(action["action"], joint["action"])

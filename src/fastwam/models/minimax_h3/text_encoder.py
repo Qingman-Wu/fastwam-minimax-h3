@@ -15,6 +15,9 @@ VISION_END = "<|vision_end|>"
 IMAGE_PAD = "<|image_pad|>"
 H3_QWEN_HIDDEN_SIZE = 5120
 H3_QWEN_HIDDEN_LAYER = 50
+H3_QWEN_ENCODER_SIGNATURE = (
+    "qwen3-vl-4.57.6:layers-0-49:final-norm-identity:last-hidden-state"
+)
 H3_VIDEO_TAG = 0
 H3_TEXT_TAG = 1
 
@@ -166,6 +169,10 @@ class MiniMaxH3TextConditioner(nn.Module):
             model.language_model.layers = nn.ModuleList(
                 list(language_layers[:H3_QWEN_HIDDEN_LAYER])
             )
+        # H3 consumes decoder layer 49's output before Qwen's final RMSNorm.
+        # On transformers 4.57.6 both last_hidden_state and hidden_states[-1]
+        # are post-norm, so truncation alone is insufficient.
+        model.language_model.norm = nn.Identity()
         del causal_model
         return cls(processor=processor, model=model.to(device), device=device, dtype=dtype)
 
@@ -206,17 +213,11 @@ class MiniMaxH3TextConditioner(nn.Module):
                 ),
                 image_grid_thw=grid.to(self.device),
                 mm_token_type_ids=mm_token_type_ids,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 use_cache=False,
                 return_dict=True,
             )
-            hidden_states = output.hidden_states
-            if hidden_states is None or len(hidden_states) <= H3_QWEN_HIDDEN_LAYER:
-                raise ValueError(
-                    "H3 Qwen must return hidden_states through native layer "
-                    f"{H3_QWEN_HIDDEN_LAYER}"
-                )
-            hidden = hidden_states[H3_QWEN_HIDDEN_LAYER][0]
+            hidden = output.last_hidden_state[0]
             if hidden.shape[-1] != H3_QWEN_HIDDEN_SIZE:
                 raise ValueError(
                     f"H3 Qwen returned hidden width {hidden.shape[-1]}, "

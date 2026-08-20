@@ -173,6 +173,9 @@ def create_fastwam_h3(
     video_fps: float = 24.0,
     action_fps: float = 8.0,
     freeze_video_expert: bool = True,
+    h3_lora_rank: int = 0,
+    h3_lora_alpha: float = 32.0,
+    h3_lora_dropout: float = 0.0,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -256,6 +259,9 @@ def create_fastwam_h3(
         video_fps=float(video_fps),
         action_fps=float(action_fps),
         freeze_video_expert=bool(freeze_video_expert),
+        h3_lora_rank=int(h3_lora_rank),
+        h3_lora_alpha=float(h3_lora_alpha),
+        h3_lora_dropout=float(h3_lora_dropout),
     )
 
 

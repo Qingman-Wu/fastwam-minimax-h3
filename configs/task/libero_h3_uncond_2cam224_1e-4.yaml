@@ -18,15 +18,16 @@ data:
     skip_padding_as_possible: true
     max_padding_retry: 50
 
-batch_size: 16
-num_workers: 16
+# Real 33B smoke peaks near 90 GiB with B=1 and checkpointing on. Larger
+# per-device batches are unsafe until optimizer/offload work lands.
+batch_size: 1
+num_workers: 4
 
 model:
   # Training reads exact Qwen layer-50 f0+instruction rows from the native
   # cache so the 32B encoder and H3 Video Expert never share one GPU.
   load_text_encoder: false
-  # The optimized 8xH20 setting has enough memory to avoid recomputation.
-  mot_checkpoint_mixed_attn: false
+  mot_checkpoint_mixed_attn: true
   # The 32 action rows cover the four transitions of five visual frames.
   # On H3's native 24-fps RoPE clock, eight controls per visual interval
   # therefore correspond to an effective action rate of 24 * 8 = 192.
@@ -41,8 +42,8 @@ save_every: 10000
 # Full-video and action flow-matching losses are both active in Scheme A.
 eval_every: 0
 
-# 16 samples/GPU x 8 GPUs keeps the original effective global batch at 128.
-gradient_accumulation_steps: 1
+# 1 sample/GPU x 8 GPUs x 16 accumulation steps keeps global batch 128.
+gradient_accumulation_steps: 16
 weight_decay: 1.0e-2
 # Action-only H3 checkpoints use the incompatible pre-Scheme-A schema.
 resume: null

@@ -70,10 +70,14 @@ def main(cfg: DictConfig) -> None:
         dtype=torch.bfloat16,
     )
     overwrite = bool(cfg.get("overwrite", False))
-    indices = range(rank, len(dataset), world_size)
+    max_samples = cfg.get("max_samples")
+    sample_count = len(dataset)
+    if max_samples is not None:
+        sample_count = min(sample_count, int(max_samples))
+    indices = range(rank, sample_count, world_size)
     progress = tqdm(
         indices,
-        total=(len(dataset) + world_size - 1 - rank) // world_size,
+        total=(sample_count + world_size - 1 - rank) // world_size,
         disable=rank != 0,
         desc="H3 Qwen layer-50 cache",
     )

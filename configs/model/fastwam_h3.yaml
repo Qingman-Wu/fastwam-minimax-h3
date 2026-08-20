@@ -12,6 +12,9 @@ keyframe_condition_strength: 0.999
 video_fps: 24.0
 action_fps: 8.0
 freeze_video_expert: true
+h3_lora_rank: 32
+h3_lora_alpha: 32.0
+h3_lora_dropout: 0.0
 
 # Full MiniMax H3 FL2VA video expert. These values are checked against
 # FL2VA/transformer/config.json at load time.

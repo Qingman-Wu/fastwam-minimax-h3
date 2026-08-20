@@ -12,9 +12,12 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import default_collate
 
+from fastwam.models.minimax_h3.text_encoder import H3_QWEN_ENCODER_SIGNATURE
+
 
 H3_QWEN_WIDTH = 5120
 H3_QWEN_LAYER = 50
+H3_CACHE_SCHEMA_VERSION = 2
 H3_CACHE_KEYS = (
     "prompt_embeds",
     "prompt_token_tags",
@@ -36,7 +39,12 @@ def _cache_digest(first_frame: torch.Tensor, instruction: str) -> str:
         .contiguous()
     )
     digest = hashlib.sha256()
-    digest.update(f"h3-qwen-layer-{H3_QWEN_LAYER}\0".encode())
+    digest.update(
+        (
+            f"h3-cache-v{H3_CACHE_SCHEMA_VERSION}\0"
+            f"{H3_QWEN_ENCODER_SIGNATURE}\0"
+        ).encode()
+    )
     digest.update(instruction.encode("utf-8"))
     digest.update(b"\0")
     digest.update(str(tuple(pixels.shape)).encode())
@@ -50,7 +58,7 @@ def h3_condition_cache_path(
     instruction: str,
 ) -> Path:
     digest = _cache_digest(first_frame, instruction)
-    return Path(cache_dir).expanduser() / f"{digest}.h3-qwen-layer50.pt"
+    return Path(cache_dir).expanduser() / f"{digest}.h3-qwen-prenorm-layer50-v2.pt"
 
 
 def save_h3_condition_cache(
@@ -74,8 +82,9 @@ def save_h3_condition_cache(
     path = h3_condition_cache_path(cache_dir, first_frame, instruction)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": H3_CACHE_SCHEMA_VERSION,
         "hidden_layer": H3_QWEN_LAYER,
+        "encoder_signature": H3_QWEN_ENCODER_SIGNATURE,
         "prompt_embeds": embeddings.detach().cpu(),
         "prompt_token_tags": token_tags,
     }
@@ -98,7 +107,11 @@ def load_h3_condition_cache(
             "Run scripts/precompute_h3_conditions.py first."
         )
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if payload.get("schema_version") != 1 or payload.get("hidden_layer") != 50:
+    if (
+        payload.get("schema_version") != H3_CACHE_SCHEMA_VERSION
+        or payload.get("hidden_layer") != H3_QWEN_LAYER
+        or payload.get("encoder_signature") != H3_QWEN_ENCODER_SIGNATURE
+    ):
         raise ValueError(f"Incompatible H3 condition cache schema in {path}")
     embeddings = payload["prompt_embeds"]
     token_tags = payload["prompt_token_tags"].to(torch.long)

@@ -19,6 +19,7 @@ def test_h3_condition_cache_is_keyed_by_first_frame_and_instruction(tmp_path):
 
     assert first != changed_text
     assert first != changed_frame
+    assert first.name.endswith(".h3-qwen-prenorm-layer50-v2.pt")
 
 
 def test_h3_condition_cache_round_trip_preserves_native_rows(tmp_path):
