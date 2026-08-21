@@ -44,9 +44,8 @@ num_epochs: 10
 # overrides num_epochs and corresponds to about 46.1 dataset traversals.
 max_steps: 100000
 log_every: 10
-# Formal launch uses the runtime-only override stop_after_step=1000, resumes
-# with 5000, then clears it. max_steps remains 100000 in every phase, so the
-# 5k-step warmup and cosine scheduler are identical to the uninterrupted run.
+# After the strict cache and B=2 gates pass, production runs continuously to
+# 100000 with stop_after_step=null and the native 5000-step warmup.
 save_every: 10000
 # A full ZeRO-2 state is about 166 GiB. Retain only the newest two states and
 # weights so the cache plus checkpoints stay within the local 2.5 TiB budget.

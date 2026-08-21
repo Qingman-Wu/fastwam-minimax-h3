@@ -18,9 +18,8 @@ lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
 num_epochs: 1
 max_steps: null
-# Optional run boundary that preserves the max_steps scheduler horizon. Use
-# stop_after_step=1000, then 5000 on resume for checkpoint diagnostics without
-# turning either canary into a separate short-schedule experiment.
+# Optional diagnostic boundary that preserves the max_steps scheduler horizon.
+# Production Experiment 37 leaves this null and runs directly to max_steps.
 stop_after_step: null
 log_every: 10
 save_every: 100

@@ -53,6 +53,7 @@ def _evaluate_gates(
     complete_file_audit: bool,
     complete_reference_audit: bool,
     replacement_count: int,
+    strict_lower_fetch_error_count: int,
     max_rows: int | None,
     b2_verified_max_rows: int,
 ) -> dict[str, bool]:
@@ -61,6 +62,7 @@ def _evaluate_gates(
         and complete_file_audit
         and complete_reference_audit
         and replacement_count == 0
+        and strict_lower_fetch_error_count == 0
     )
     b2_memory_gate_passed = (
         max_rows is not None and max_rows <= b2_verified_max_rows
@@ -159,6 +161,11 @@ def main(cfg: DictConfig) -> None:
     audited_sample_count = 0
     replacement_count = 0
     sample_attempt_count = 0
+    requested_sample_count = 0
+    resolved_sample_count = 0
+    padding_remap_count = 0
+    strict_lower_fetch_error_count = 0
+    padding_remap_records = []
     strict_getter_used = False
     if verify_dataset_references:
         dataset = instantiate(cfg.data.train)
@@ -246,6 +253,39 @@ def main(cfg: DictConfig) -> None:
                 world_size,
             )
         )
+        requested_sample_count = sum(
+            _gather_objects(
+                int(getattr(dataset, "strict_requested_sample_count", 0)),
+                world_size,
+            )
+        )
+        resolved_sample_count = sum(
+            _gather_objects(
+                int(getattr(dataset, "strict_resolved_sample_count", 0)),
+                world_size,
+            )
+        )
+        padding_remap_count = sum(
+            _gather_objects(
+                int(getattr(dataset, "padding_remap_count", 0)),
+                world_size,
+            )
+        )
+        strict_lower_fetch_error_count = sum(
+            _gather_objects(
+                int(getattr(dataset, "strict_lower_fetch_error_count", 0)),
+                world_size,
+            )
+        )
+        rank_remap_records = _gather_objects(
+            list(getattr(dataset, "padding_remap_records", ())),
+            world_size,
+        )
+        padding_remap_records = [
+            record
+            for records in rank_remap_records
+            for record in records
+        ][:max_recorded_errors]
     else:
         explicitly_missing_files = set()
 
@@ -286,6 +326,7 @@ def main(cfg: DictConfig) -> None:
         complete_file_audit=complete_file_audit,
         complete_reference_audit=complete_reference_audit,
         replacement_count=replacement_count,
+        strict_lower_fetch_error_count=strict_lower_fetch_error_count,
         max_rows=max_rows,
         b2_verified_max_rows=b2_verified_max_rows,
     )
@@ -308,7 +349,17 @@ def main(cfg: DictConfig) -> None:
         "dataset_length": dataset_length,
         "expected_sample_count": expected_sample_count,
         "audited_sample_count": audited_sample_count,
-        "strict_sample_attempt_count": audited_sample_count,
+        "strict_sample_attempt_count": requested_sample_count,
+        "requested_sample_count": requested_sample_count,
+        "resolved_sample_count": resolved_sample_count,
+        "padding_remap_count": padding_remap_count,
+        "padding_remap_rate": (
+            padding_remap_count / requested_sample_count
+            if requested_sample_count > 0
+            else 0.0
+        ),
+        "padding_remap_records": padding_remap_records,
+        "strict_lower_fetch_error_count": strict_lower_fetch_error_count,
         "complete_reference_audit": complete_reference_audit,
         "strict_getter_used": strict_getter_used,
         "referenced_unique_file_count": len(referenced_files),

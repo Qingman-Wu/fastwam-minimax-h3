@@ -611,17 +611,18 @@ stop_action_gradient_to_h3: false
 This preserves the explicitly requested original FastWAM optimization
 topology. The diagnostics do not justify silently changing the baseline to a
 new beta: the gradient imbalance is real, but one-step local LoRA perturbation
-is small, and a global beta cannot balance all depths. The appropriate next
-step is a short beta=1 training canary with the corrected accumulated loss and
-peak-memory logs, followed by checkpoint diagnostics. A beta or layer-wise
-scaling mechanism remains a research ablation if the video objective degrades.
+is small, and a global beta cannot balance all depths. After the strict cache
+and B=2 gates pass, the user has chosen a continuous beta=1 100k production
+run without mandatory 1k/5k stops. Checkpoint diagnostics remain available for
+saved production checkpoints. A beta or layer-wise scaling mechanism remains a
+research ablation if the video objective degrades.
 
 ## 13. Automated and real-system verification
 
 Automated:
 
 ```text
-96 passed, 1 warning
+110 passed, 1 warning
 python compileall: pass
 git diff --check: pass
 ```
@@ -818,16 +819,18 @@ Time padding and padded action dimensions are both excluded.
 1. enumerate every unique schema-3 cache file and strictly validate that it is
    readable, matches the manifest, has a nonempty finite floating-point
    `[L,5120]` embedding, and has exact integer modality tags in `{0,1}`;
-2. instantiate the production dataset and visit every one of its 277,713
-   original indices through `get_strict()`, proving that each requested sample
-   resolves to its own valid cache entry without `__getitem__` replacement.
+2. instantiate the production dataset and visit all 277,713 requested indices,
+   preserve the exact deterministic temporal-padding remap policy, and strictly
+   read every resulting effective sample without exception-driven substitution
+   in either RobotVideoDataset or BaseLerobotDataset.
 
 The report contains unique-file and sample-reference row-length histograms,
 both maxima, unique referenced-file count, missing/orphan counts, replacement
 telemetry, and separate gates:
 
 - `formal_cache_gate_passed`: both strict scans are complete, all expected
-  samples succeeded, and replacement count is zero;
+  samples succeeded, outer replacement count is zero, and strict lower-fetch
+  error count is zero;
 - `b2_memory_gate_passed`: observed `max_rows` does not exceed the configured
   `b2_verified_max_rows` default of 140;
 - `requires_memory_resmoke`: cache integrity passed but B=2 requires a new
@@ -853,32 +856,29 @@ If either reported maximum exceeds 140, the script sets the B=2 gate false and
 exits nonzero until `scripts/smoke_h3_b2_memory.py` passes with that exact
 maximum row length and the verified limit is explicitly updated.
 
-A strict live partial smoke audited four unique files and two original dataset
+A strict live partial smoke audited four unique files and two requested dataset
 references. It correctly found dataset length 277,713, schema 3, valid 140-row
 references, no replacements/errors, `passed=true`,
 `formal_cache_gate_passed=false`, and `formal_gate_passed=false`.
 
-### 17.3 Continuous 1k/5k canary boundaries
+### 17.3 Direct 100k production policy
 
-Trainer now supports `stop_after_step` independently of `max_steps`. The formal
-scheduler remains constructed with `max_steps=100000`, including its 5000-step
-warmup, while the process stops and writes both weights and complete ZeRO-2
-state at the requested boundary.
+Trainer still supports `stop_after_step` as an optional diagnostic tool without
+changing the scheduler horizon. The final user decision for Experiment 37 is
+not to use mandatory 1k/5k stops.
 
-The continuous sequence is:
+After both formal cache and B=2 memory gates pass, production starts with:
 
 ```text
-max_steps=100000 stop_after_step=1000
-  -> diagnose step 1000
-resume full state, max_steps=100000 stop_after_step=5000
-  -> diagnose step 5000
-resume full state, max_steps=100000 stop_after_step=null
-  -> continue to 100000 with save_every=10000
+max_steps=100000
+stop_after_step=null
+save_every=10000
 ```
 
-Resuming with a boundary already reached is rejected instead of silently
-training one extra step. This is not a separate short-scheduler canary and does
-not reset optimizer, scheduler, sampler, epoch, or accumulation state.
+The scheduler therefore uses the native 100k horizon and 5000-step warmup in
+one uninterrupted run. Checkpoint-aware diagnostics can still be run against
+normal saved checkpoints, but they are not launch/resume gates at steps 1000
+or 5000.
 
 ### 17.4 Audio-AdaLN trimming is not part of this baseline
 

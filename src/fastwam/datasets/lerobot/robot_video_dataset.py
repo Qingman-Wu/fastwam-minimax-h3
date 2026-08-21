@@ -19,7 +19,10 @@ from ..h3_condition_cache import (
     collate_h3_condition_samples,
     load_h3_condition_cache,
 )
-from ..padding import fetch_unpadded_temporal_sample, validate_replacement_rate
+from ..padding import (
+    fetch_unpadded_temporal_sample_with_index,
+    validate_replacement_rate,
+)
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
 from accelerate import PartialState
@@ -97,6 +100,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.sample_attempt_count = 0
         self.replacement_count = 0
         self.replacement_exception_types = Counter()
+        self.strict_requested_sample_count = 0
+        self.strict_resolved_sample_count = 0
+        self.padding_remap_count = 0
+        self.strict_lower_fetch_error_count = 0
+        self.padding_remap_records = []
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
 
@@ -140,18 +148,55 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.lerobot_dataset)
 
-    def _get(self, idx):
+    def _fetch_temporal_sample(self, idx, *, strict_lower_fetch: bool):
+        if strict_lower_fetch:
+            self.strict_requested_sample_count += 1
+
+        lower_fetch = (
+            self.lerobot_dataset.get_strict
+            if strict_lower_fetch
+            else self.lerobot_dataset.__getitem__
+        )
+
+        def fetch(sample_index):
+            try:
+                return lower_fetch(sample_index)
+            except Exception:
+                if strict_lower_fetch:
+                    self.strict_lower_fetch_error_count += 1
+                raise
+
         if self.skip_padding_as_possible:
             retry_rng = np.random.default_rng(int(idx))
-            sample = fetch_unpadded_temporal_sample(
-                self.lerobot_dataset.__getitem__,
+            sample, resolved_index = fetch_unpadded_temporal_sample_with_index(
+                fetch,
                 initial_index=idx,
                 dataset_size=len(self.lerobot_dataset),
                 max_retries=self.max_padding_retry,
                 random_index=lambda size: int(retry_rng.integers(size)),
             )
         else:
-            sample = self.lerobot_dataset[idx]
+            sample = fetch(idx)
+            resolved_index = int(idx)
+        if strict_lower_fetch:
+            self.strict_resolved_sample_count += 1
+            if resolved_index != int(idx):
+                self.padding_remap_count += 1
+                if len(self.padding_remap_records) < 20:
+                    self.padding_remap_records.append(
+                        {
+                            "requested_index": int(idx),
+                            "resolved_index": int(resolved_index),
+                            "reason": "temporal_padding",
+                        }
+                    )
+        return sample, resolved_index
+
+    def _get(self, idx, *, strict_lower_fetch: bool = False):
+        sample, _ = self._fetch_temporal_sample(
+            idx,
+            strict_lower_fetch=strict_lower_fetch,
+        )
         
         image_is_pad = sample["image_is_pad"]
 
@@ -296,9 +341,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return context, context_mask
 
     def get_strict(self, idx):
-        """Return the requested index without training-time replacement."""
+        """Apply production padding remap without exception substitution."""
 
-        return self._get(idx)
+        return self._get(idx, strict_lower_fetch=True)
 
     def _record_replacement(self, error: Exception):
         self.replacement_count += 1

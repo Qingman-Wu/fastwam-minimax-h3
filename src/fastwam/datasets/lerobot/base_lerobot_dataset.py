@@ -176,35 +176,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
     def _get_additional_data(self, sample, lerobot_sample):
         return sample
 
-    def __getitem__(self, idx):
-        if idx >= len(self):
-            raise IndexError(f"Index {idx} out of bounds {len(self)}.")
+    def _load_lerobot_sample_once(self, idx):
+        lerobot_sample = self.multi_dataset[idx]
+        return self._split_lerobot_sample(lerobot_sample)
 
-        # Retry with random indices until we successfully load a frame.
-        sample_idx = idx
-        attempt = 0
-        last_exception: Optional[Exception] = None
-        while attempt < MAX_GETITEM_ATTEMPT:
-            try:
-                lerobot_sample = self.multi_dataset[sample_idx]
-                lerobot_sample = self._split_lerobot_sample(lerobot_sample)
-                break
-            except Exception as err:
-                attempt += 1
-                last_exception = err
-                logger.warning(
-                    f"Error loading sample {sample_idx} (attempt {attempt}). "
-                    "Retrying with a random index. "
-                    f"Error: {err}"
-                )
-                sample_idx = np.random.randint(len(self))
-                print(traceback.format_exc())
-        else:
-            raise RuntimeError(
-                f"Failed to load a valid sample after {MAX_GETITEM_ATTEMPT} attempts "
-                f"for index {idx}."
-            ) from last_exception
-
+    def _build_sample(self, sample_idx, lerobot_sample):
         # Get data from lerobot, organized in nested dict
         sample = {
             "idx": sample_idx,
@@ -238,6 +214,44 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             sample = self.processor.preprocess(sample)
 
         return sample
+
+    def get_strict(self, idx):
+        """Load exactly one index without exception-driven resampling."""
+
+        if not 0 <= idx < len(self):
+            raise IndexError(f"Index {idx} out of bounds {len(self)}.")
+        lerobot_sample = self._load_lerobot_sample_once(idx)
+        return self._build_sample(idx, lerobot_sample)
+
+    def __getitem__(self, idx):
+        if idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds {len(self)}.")
+
+        # Retry with random indices until we successfully load a frame.
+        sample_idx = idx
+        attempt = 0
+        last_exception: Optional[Exception] = None
+        while attempt < MAX_GETITEM_ATTEMPT:
+            try:
+                lerobot_sample = self._load_lerobot_sample_once(sample_idx)
+                break
+            except Exception as err:
+                attempt += 1
+                last_exception = err
+                logger.warning(
+                    f"Error loading sample {sample_idx} (attempt {attempt}). "
+                    "Retrying with a random index. "
+                    f"Error: {err}"
+                )
+                sample_idx = np.random.randint(len(self))
+                print(traceback.format_exc())
+        else:
+            raise RuntimeError(
+                f"Failed to load a valid sample after {MAX_GETITEM_ATTEMPT} attempts "
+                f"for index {idx}."
+            ) from last_exception
+
+        return self._build_sample(sample_idx, lerobot_sample)
 
     def set_processor(self, processor: BaseProcessor):
         """Set processor instance from external initialization."""

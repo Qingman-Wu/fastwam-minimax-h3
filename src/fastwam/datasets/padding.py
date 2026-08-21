@@ -54,6 +54,26 @@ def fetch_unpadded_temporal_sample(
 ) -> Mapping[str, Any]:
     """Fetch a sample without padding or fail instead of returning a bad target."""
 
+    sample, _ = fetch_unpadded_temporal_sample_with_index(
+        fetch,
+        initial_index=initial_index,
+        dataset_size=dataset_size,
+        max_retries=max_retries,
+        random_index=random_index,
+    )
+    return sample
+
+
+def fetch_unpadded_temporal_sample_with_index(
+    fetch: Callable[[int], Mapping[str, Any]],
+    *,
+    initial_index: int,
+    dataset_size: int,
+    max_retries: int,
+    random_index: Callable[[int], int],
+) -> tuple[Mapping[str, Any], int]:
+    """Fetch an unpadded sample and return its effective dataset index."""
+
     dataset_size = int(dataset_size)
     max_retries = int(max_retries)
     if dataset_size <= 0:
@@ -64,7 +84,7 @@ def fetch_unpadded_temporal_sample(
     for attempt in range(max_retries + 1):
         sample = fetch(sample_index)
         if not _has_temporal_padding(sample):
-            return sample
+            return sample, sample_index
         if attempt < max_retries:
             sample_index = int(random_index(dataset_size))
             if not 0 <= sample_index < dataset_size:
