@@ -5,6 +5,7 @@ from fastwam.datasets.h3_condition_cache import (
     h3_condition_cache_path,
     initialize_h3_condition_cache,
     load_h3_condition_cache,
+    load_h3_condition_cache_file,
     save_h3_condition_cache,
 )
 
@@ -67,6 +68,30 @@ def test_h3_condition_cache_manifest_rejects_different_qwen_weights(tmp_path):
         assert "manifest" in str(error)
     else:
         raise AssertionError("Different Qwen weights must invalidate the cache")
+
+
+def test_direct_cache_file_loader_strictly_validates_manifest(tmp_path):
+    frame = torch.zeros(3, 4, 4)
+    manifest = initialize_h3_condition_cache(
+        tmp_path,
+        qwen_checkpoint_fingerprint="sha256:qwen-a",
+        processor_fingerprint="sha256:processor-a",
+    )
+    path = save_h3_condition_cache(
+        tmp_path,
+        first_frame=frame,
+        instruction="move",
+        embeddings=torch.zeros(2, 5120),
+        token_tags=torch.tensor([1, 0]),
+    )
+    incompatible = {**manifest, "processor_fingerprint": "sha256:other"}
+
+    try:
+        load_h3_condition_cache_file(path, manifest=incompatible)
+    except ValueError as error:
+        assert "schema" in str(error)
+    else:
+        raise AssertionError("Direct file audit must reject a manifest mismatch")
 
 
 def test_h3_condition_collate_pads_variable_qwen_lengths_without_valid_padding():

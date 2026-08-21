@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from scripts.diagnose_h3_joint_gradient import (
+    _action_rollout_metrics,
     _beta_sweep,
     _gradient_stats,
     _representation_drift,
@@ -93,3 +94,22 @@ def test_memory_smoke_padding_creates_contiguous_valid_rows():
 
     assert batch["prompt_embeds"].shape == (2, 5, 4)
     assert batch["prompt_attention_mask"].all()
+
+
+def test_action_rollout_metrics_ignore_padded_times_and_dimensions():
+    target = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    predicted = target.clone()
+    predicted[0, 0] = 2.0
+    predicted[0, 1] = 1_000.0
+    predicted[1] = -1_000.0
+
+    metrics = _action_rollout_metrics(
+        predicted,
+        target,
+        action_is_pad=torch.tensor([False, True]),
+        action_dim_is_pad=torch.tensor([False, True]),
+    )
+
+    assert metrics["valid_element_count"] == 1
+    assert metrics["l1"] == pytest.approx(1.0)
+    assert metrics["mse"] == pytest.approx(1.0)

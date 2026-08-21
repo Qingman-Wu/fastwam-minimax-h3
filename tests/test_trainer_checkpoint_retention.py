@@ -22,3 +22,15 @@ def test_checkpoint_retention_keeps_only_newest_states_and_weights(tmp_path):
         "step_000002.pt",
         "step_000003.pt",
     ]
+
+
+def test_canary_stop_is_independent_of_scheduler_max_steps():
+    trainer = Wan22Trainer.__new__(Wan22Trainer)
+    trainer.max_steps = 100_000
+    trainer.stop_after_step = 1_000
+
+    trainer.global_step = 999
+    assert not trainer._reached_canary_stop()
+
+    trainer.global_step = 1_000
+    assert trainer._reached_canary_stop()

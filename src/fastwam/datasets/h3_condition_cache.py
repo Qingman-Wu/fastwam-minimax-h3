@@ -170,6 +170,17 @@ def load_h3_condition_cache(
             f"Missing native H3 condition cache: {path}. "
             "Run scripts/precompute_h3_conditions.py first."
         )
+    return load_h3_condition_cache_file(path, manifest=manifest)
+
+
+def load_h3_condition_cache_file(
+    path: str | Path,
+    *,
+    manifest: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Load and validate one cache file without recomputing its content key."""
+
+    path = Path(path)
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if (
         payload.get("schema_version") != H3_CACHE_SCHEMA_VERSION

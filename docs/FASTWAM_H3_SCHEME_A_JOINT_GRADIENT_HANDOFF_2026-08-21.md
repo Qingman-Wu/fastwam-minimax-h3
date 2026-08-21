@@ -715,12 +715,14 @@ Model/runtime:
 Trainer/data:
 
 - `src/fastwam/trainer.py`
+- `src/fastwam/datasets/h3_condition_cache.py`
 - `src/fastwam/datasets/padding.py`
 - `src/fastwam/datasets/lerobot/robot_video_dataset.py`
 
 Diagnostic scripts and artifacts:
 
 - `scripts/diagnose_h3_joint_gradient.py`
+- `scripts/audit_h3_condition_cache.py`
 - `scripts/smoke_h3_b2_memory.py`
 - `artifacts/h3_joint_diagnostic_sample0_beta1.json`
 - `artifacts/h3_joint_local_probe_sample1_beta1.json`
@@ -767,3 +769,130 @@ Updated prior handoffs:
    intended experiment budget recorded in `EXPERIMENT_37.md`.
 10. Confirm accumulation-window losses are reduced using exact sample-weighted
     sums/counts across every microbatch and rank.
+
+## 17. Post-`f14ea0d` reviewer gates
+
+AI-A and AI-C independently accepted the beta=1 joint-gradient baseline and the
+current B=2 evidence, but required two hard gates and two operational additions
+before an unattended 100k continuation. These are now implemented in code.
+
+### 17.1 Checkpoint-aware diagnostics
+
+`scripts/diagnose_h3_joint_gradient.py` now accepts:
+
+```yaml
+diagnostic:
+  checkpoint_path: /absolute/path/to/step_001000.pt
+  hash_checkpoint: true
+```
+
+The checkpoint is loaded through the model's strict schema-3
+`load_checkpoint()` path before any sample is evaluated. The JSON schema is now
+version 2 and records checkpoint path, size, SHA256, schema, saved step,
+backbone, and base-H3 fingerprint.
+
+Selected H3 QKV/out projections capture two distinct measurements:
+
+1. `current_lora_output_before_probe`: the LoRA/base RMS ratio of the loaded
+   checkpoint before any synthetic update;
+2. `local_lora_output_after_one_probe_step`: the prior reversible one-step
+   AdamW stress probe.
+
+The original LoRA state is restored after the probe. Therefore rollout metrics
+evaluate the loaded checkpoint, not the temporary probe update.
+
+The same deterministic rollout now records padding-aware normalized action
+metrics in addition to five-frame latent metrics:
+
+- valid-element count;
+- L1, MSE, and RMSE;
+- relative L2;
+- cosine.
+
+Time padding and padded action dimensions are both excluded.
+
+### 17.2 Full-cache audit
+
+`scripts/audit_h3_condition_cache.py` performs both required audit layers:
+
+1. enumerate every unique schema-3 cache file and strictly validate that it is
+   readable, matches the manifest, has width 5120, and has valid modality tags;
+2. instantiate the production dataset and visit every one of its 277,713
+   indices, proving that each training sample resolves to a valid cache entry.
+
+The report contains unique-file and sample-reference row-length histograms,
+both maxima, unique referenced-file count, missing/orphan counts, replacement
+telemetry, and separate `passed` and `formal_gate_passed` fields. The formal
+gate is true only when both scans are complete, not when a smoke-test subset
+passes.
+
+The intended post-cache command is:
+
+```bash
+PATH="/root/wuqingman/.venv-fastwam/bin:$PATH" \
+PYTHONPATH="/root/wuqingman/.deps-transformers-4.57.6:src" \
+torchrun --standalone --nproc_per_node=8 \
+  scripts/audit_h3_condition_cache.py \
+  task=libero_h3_uncond_2cam224_1e-4 \
+  +cache_audit.output_path=artifacts/h3_condition_cache_full_audit.json
+```
+
+If either reported maximum exceeds 140, B=2 is blocked until
+`scripts/smoke_h3_b2_memory.py` passes with that exact maximum row length.
+
+A live partial smoke audited four unique files and two dataset references. It
+correctly found dataset length 277,713, schema 3, valid 140-row references, no
+errors, `passed=true`, and `formal_gate_passed=false`.
+
+### 17.3 Continuous 1k/5k canary boundaries
+
+Trainer now supports `stop_after_step` independently of `max_steps`. The formal
+scheduler remains constructed with `max_steps=100000`, including its 5000-step
+warmup, while the process stops and writes both weights and complete ZeRO-2
+state at the requested boundary.
+
+The continuous sequence is:
+
+```text
+max_steps=100000 stop_after_step=1000
+  -> diagnose step 1000
+resume full state, max_steps=100000 stop_after_step=5000
+  -> diagnose step 5000
+resume full state, max_steps=100000 stop_after_step=null
+  -> continue to 100000 with save_every=10000
+```
+
+Resuming with a boundary already reached is rejected instead of silently
+training one extra step. This is not a separate short-scheduler canary and does
+not reset optimizer, scheduler, sampler, epoch, or accumulation state.
+
+### 17.4 Audio-AdaLN trimming is not part of this baseline
+
+The proposed `[video | text | audio] -> [video | text]` frozen-weight trimming
+could materially increase the B=2 margin, but it changes the instantiated H3
+base and therefore its fingerprint/checkpoint contract. It is being treated as
+an isolated follow-up optimization requiring numerical tag-0/tag-1 equivalence
+tests and a new real 8xH20 memory smoke. It is not mixed into the accepted
+beta=1 baseline or used to bypass the full-cache maximum-row gate.
+
+The local implementation confirms the opportunity and the required mechanics.
+Every one of 50 blocks has an AdaLN linear projection
+`2688 -> 5376 * 6 * 3`; this is approximately 13.01B weights in total. The
+third modality accounts for approximately 4.337B parameters, or 8.08 GiB at
+BF16. Current indexing is `inverse_indices * 3 + tag`, and the video-only path
+uses stride 3. A two-slot variant would have to:
+
+- copy the first contiguous `5376 * 6 * 2` output rows and biases from every
+  released projection;
+- reshape with two modalities, use `inverse_indices * 2 + tag`, and use video
+  stride 2;
+- reject every tag greater than 1;
+- teach the safetensors loader to perform this explicit shape conversion,
+  because its current `assign=True` load is strict about target tensor shapes;
+- include the AdaLN variant in the base fingerprint and schema-3 LoRA
+  checkpoint config.
+
+Those changes should be exactly equivalent for tags 0 and 1 in real arithmetic,
+but the equivalence must be asserted block-by-block against the unchanged
+three-slot model before adopting it. The current cache contains only tags 0/1,
+so no data migration would be required.

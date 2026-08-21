@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -134,6 +135,84 @@ def _restore_lora_state(named_branches, state) -> None:
         branch.load_state_dict(device_state, strict=True)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _diagnostic_projections(model, block_indices):
+    projections = {}
+    for block_index in block_indices:
+        block = model.video_expert.blocks[block_index]
+        for projection_name in ("qkv_proj", "out_proj"):
+            projection = getattr(block.attn, projection_name)
+            projection.capture_diagnostics = True
+            projection.diagnostic_stats = None
+            projections[
+                f"blocks.{block_index}.attn.{projection_name}"
+            ] = projection
+    return projections
+
+
+def _collect_projection_diagnostics(projections, *, disable: bool) -> dict:
+    report = {}
+    for name, projection in projections.items():
+        if projection.diagnostic_stats is None:
+            raise RuntimeError(f"Missing LoRA output diagnostics for {name}")
+        report[name] = dict(projection.diagnostic_stats)
+        projection.diagnostic_stats = None
+        if disable:
+            projection.capture_diagnostics = False
+    return report
+
+
+def _action_rollout_metrics(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    action_is_pad: torch.Tensor | None,
+    action_dim_is_pad: torch.Tensor | None,
+) -> dict[str, float | int | list[int]]:
+    predicted = predicted.detach().double().cpu()
+    target = target.detach().double().cpu()
+    if predicted.shape != target.shape:
+        raise ValueError(
+            f"Action rollout/target shape mismatch: {tuple(predicted.shape)} "
+            f"!= {tuple(target.shape)}"
+        )
+    valid = torch.ones_like(target, dtype=torch.bool)
+    if action_is_pad is not None:
+        valid &= ~action_is_pad.detach().cpu().bool().unsqueeze(-1)
+    if action_dim_is_pad is not None:
+        valid &= ~action_dim_is_pad.detach().cpu().bool().unsqueeze(0)
+    predicted_valid = predicted[valid]
+    target_valid = target[valid]
+    if predicted_valid.numel() == 0:
+        raise ValueError("Action rollout has no valid target elements")
+    difference = predicted_valid - target_valid
+    return {
+        "shape": list(predicted.shape),
+        "valid_element_count": int(difference.numel()),
+        "l1": float(difference.abs().mean()),
+        "mse": float(difference.square().mean()),
+        "rmse": float(difference.square().mean().sqrt()),
+        "relative_l2": float(
+            torch.linalg.vector_norm(difference)
+            / torch.linalg.vector_norm(target_valid).clamp(min=1e-12)
+        ),
+        "cosine": float(
+            torch.nn.functional.cosine_similarity(
+                predicted_valid,
+                target_valid,
+                dim=0,
+            )
+        ),
+    }
+
+
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     diagnostic_cfg = cfg.get("diagnostic", {})
@@ -152,6 +231,13 @@ def main(cfg: DictConfig) -> None:
     )
     num_inference_steps = int(diagnostic_cfg.get("num_inference_steps", 20))
     run_latent_rollout = bool(diagnostic_cfg.get("run_latent_rollout", True))
+    checkpoint_path_value = diagnostic_cfg.get("checkpoint_path")
+    checkpoint_path = (
+        None
+        if checkpoint_path_value in (None, "")
+        else Path(str(checkpoint_path_value)).expanduser().resolve()
+    )
+    hash_checkpoint = bool(diagnostic_cfg.get("hash_checkpoint", True))
     seed = int(diagnostic_cfg.get("seed", cfg.seed))
     output_path = Path(
         str(
@@ -172,6 +258,27 @@ def main(cfg: DictConfig) -> None:
     torch.cuda.manual_seed_all(seed)
 
     model = instantiate(cfg.model, model_dtype=model_dtype, device=str(device))
+    checkpoint_report = None
+    if checkpoint_path is not None:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Diagnostic checkpoint not found: {checkpoint_path}")
+        checkpoint_payload = model.load_checkpoint(checkpoint_path)
+        checkpoint_report = {
+            "path": str(checkpoint_path),
+            "size_bytes": int(checkpoint_path.stat().st_size),
+            "schema_version": checkpoint_payload.get("schema_version"),
+            "step": checkpoint_payload.get("step"),
+            "backbone": checkpoint_payload.get("backbone"),
+            "base_h3_fingerprint": checkpoint_payload.get(
+                "h3_lora_config", {}
+            ).get("base_h3_fingerprint"),
+        }
+        del checkpoint_payload
+        checkpoint_report["sha256"] = (
+            _sha256_file(checkpoint_path)
+            if hash_checkpoint
+            else None
+        )
     dataset = instantiate(cfg.data.train)
     if not 0 <= sample_index < len(dataset):
         raise IndexError(f"sample_index {sample_index} is outside dataset")
@@ -183,10 +290,15 @@ def main(cfg: DictConfig) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.cuda.reset_peak_memory_stats(device)
 
+    diagnostic_projections = _diagnostic_projections(model, block_indices)
     loss, metrics, diagnostics = model.training_loss(
         sample,
         return_diagnostics=True,
         debug_block_indices=block_indices,
+    )
+    current_lora_output_report = _collect_projection_diagnostics(
+        diagnostic_projections,
+        disable=False,
     )
     named_branches = model._named_h3_lora_branches()
     if not named_branches:
@@ -273,17 +385,6 @@ def main(cfg: DictConfig) -> None:
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
-    diagnostic_projections = {}
-    for block_index in block_indices:
-        block = model.video_expert.blocks[block_index]
-        for projection_name in ("qkv_proj", "out_proj"):
-            projection = getattr(block.attn, projection_name)
-            projection.capture_diagnostics = True
-            projection.diagnostic_stats = None
-            diagnostic_projections[
-                f"blocks.{block_index}.attn.{projection_name}"
-            ] = projection
-
     with torch.no_grad():
         _, updated_metrics, updated_diagnostics = model.training_loss(
             sample,
@@ -301,13 +402,10 @@ def main(cfg: DictConfig) -> None:
         )
         for block_index in block_indices
     }
-    local_lora_output_report = {}
-    for name, projection in diagnostic_projections.items():
-        if projection.diagnostic_stats is None:
-            raise RuntimeError(f"Missing LoRA output diagnostics for {name}")
-        local_lora_output_report[name] = projection.diagnostic_stats
-        projection.capture_diagnostics = False
-        projection.diagnostic_stats = None
+    local_lora_output_report = _collect_projection_diagnostics(
+        diagnostic_projections,
+        disable=True,
+    )
     _restore_lora_state(named_branches, original_lora_state)
     del (
         optimizer,
@@ -320,6 +418,7 @@ def main(cfg: DictConfig) -> None:
     torch.cuda.empty_cache()
 
     latent_report = None
+    action_report = None
     if run_latent_rollout:
         video = sample["video"].to(device=device, dtype=model_dtype)
         input_image = video[0, :, 0].unsqueeze(0)
@@ -366,11 +465,26 @@ def main(cfg: DictConfig) -> None:
                 )
             ),
         }
+        action_report = _action_rollout_metrics(
+            rollout["action"],
+            sample["action"][0],
+            action_is_pad=(
+                None
+                if sample.get("action_is_pad") is None
+                else sample["action_is_pad"][0]
+            ),
+            action_dim_is_pad=(
+                None
+                if sample.get("action_dim_is_pad") is None
+                else sample["action_dim_is_pad"][0]
+            ),
+        )
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "sample_index": sample_index,
         "seed": seed,
+        "checkpoint": checkpoint_report,
         "stop_action_gradient_to_h3": model.stop_action_gradient_to_h3,
         "probe": {
             "optimizer": "AdamW",
@@ -383,6 +497,7 @@ def main(cfg: DictConfig) -> None:
         },
         "gradient_by_block": gradient_report,
         "representation_probe": {
+            "current_lora_output_before_probe": current_lora_output_report,
             "local_lora_output_after_one_probe_step": local_lora_output_report,
             "repeated_forward_hidden_difference": repeated_forward_hidden_difference,
             "warning": (
@@ -391,6 +506,7 @@ def main(cfg: DictConfig) -> None:
             ),
         },
         "latent_rollout": latent_report,
+        "action_rollout_normalized": action_report,
         "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
         "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3),
     }

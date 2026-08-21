@@ -98,6 +98,14 @@ class Wan22Trainer:
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
+        stop_after_step = cfg.get("stop_after_step")
+        self.stop_after_step = (
+            None if stop_after_step is None else int(stop_after_step)
+        )
+        if self.stop_after_step is not None and self.stop_after_step <= 0:
+            raise ValueError(
+                f"`stop_after_step` must be positive, got {self.stop_after_step}"
+            )
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
         self.save_final_checkpoint = bool(cfg.get("save_final_checkpoint", True))
@@ -164,6 +172,14 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
+        if (
+            self.stop_after_step is not None
+            and self.stop_after_step > self.max_steps
+        ):
+            raise ValueError(
+                f"`stop_after_step` ({self.stop_after_step}) cannot exceed "
+                f"`max_steps` ({self.max_steps})"
+            )
         warmup_steps = int(total_train_steps * 0.05)
         self.scheduler = self._build_scheduler(
             scheduler_type=cfg.lr_scheduler_type,
@@ -851,6 +867,12 @@ class Wan22Trainer:
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
+    def _reached_canary_stop(self) -> bool:
+        return (
+            self.stop_after_step is not None
+            and self.global_step >= self.stop_after_step
+        )
+
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
@@ -916,6 +938,12 @@ class Wan22Trainer:
 
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
+        if self._reached_canary_stop():
+            raise ValueError(
+                f"Training is already at step {self.global_step}, which meets "
+                f"`stop_after_step={self.stop_after_step}`. Increase or clear the "
+                "canary boundary before resuming."
+            )
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
         data_iter = iter(self.train_loader)
@@ -1105,6 +1133,21 @@ class Wan22Trainer:
                                 ckpt_info["weights_path"],
                                 ckpt_info["state_path"],
                             )
+
+                    if self._reached_canary_stop():
+                        if not saved_this_step:
+                            ckpt_info = self.save_checkpoint()
+                        if self.accelerator.is_main_process:
+                            logger.info(
+                                "[canary] stop_after_step reached step=%d "
+                                "weights=%s state=%s; max_steps=%d scheduler "
+                                "horizon is unchanged",
+                                self.global_step,
+                                ckpt_info["weights_path"],
+                                ckpt_info["state_path"],
+                                self.max_steps,
+                            )
+                        return
 
                     if self.global_step >= self.max_steps:
                         if self.save_final_checkpoint and not saved_this_step:
