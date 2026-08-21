@@ -896,3 +896,14 @@ Those changes should be exactly equivalent for tags 0 and 1 in real arithmetic,
 but the equivalence must be asserted block-by-block against the unchanged
 three-slot model before adopting it. The current cache contains only tags 0/1,
 so no data migration would be required.
+
+The final H3 layer is already video-only and must remain unchanged. Qwen cache
+schema 3 is also unaffected because it fingerprints Qwen/processor artifacts
+and stores only tags 0/1. In contrast, existing Accelerate full-state
+directories contain the old model geometry and cannot safely resume into the
+trimmed model. Frozen-base schema-3 weights contain only Action Expert and LoRA
+tensors, so they could be supported through an explicit metadata migration;
+silent compatibility under the old fingerprint is forbidden. The preferred
+contract is a transformed-base fingerprint such as
+`adaln-layout:vta-to-vt-v1` plus either checkpoint schema 4 or an explicit,
+tested schema-3 migration path.
