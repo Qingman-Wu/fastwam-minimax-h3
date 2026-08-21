@@ -92,6 +92,35 @@ def test_action_reads_h3_values_without_backpropagating_into_h3():
     assert action.grad is not None
 
 
+def test_action_loss_backpropagates_into_h3_by_default():
+    h3 = torch.randn(1, 4, 2, requires_grad=True)
+    state = torch.randn(1, 1, 2)
+    action = torch.randn(1, 2, 2, requires_grad=True)
+    action_stream = torch.cat((state, action), dim=1)
+    h3_q, h3_k, h3_v = as_qkv(h3)
+    action_q, action_k, action_v = as_qkv(action_stream)
+    masks = AsymmetricAttentionMasks(
+        h3_valid=torch.ones(1, 4, dtype=torch.bool),
+        h3_condition=torch.tensor([[True, True, False, False]]),
+        action_valid=torch.ones(1, 3, dtype=torch.bool),
+    )
+
+    _, action_out = asymmetric_joint_attention(
+        h3_q=h3_q,
+        h3_k=h3_k,
+        h3_v=h3_v,
+        action_q=action_q,
+        action_k=action_k,
+        action_v=action_v,
+        masks=masks,
+    )
+    action_out.square().mean().backward()
+
+    assert h3.grad is not None
+    assert torch.count_nonzero(h3.grad) > 0
+    assert action.grad is not None
+
+
 def test_state_query_cannot_read_noisy_video_or_noisy_action():
     condition = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
     video_a = torch.zeros(1, 2, 2)

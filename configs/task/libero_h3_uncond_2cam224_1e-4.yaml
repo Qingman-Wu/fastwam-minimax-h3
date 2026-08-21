@@ -20,7 +20,7 @@ data:
 
 # B=1 without mixed-attention activation checkpointing is the fastest stable
 # 8xH20 setting. B=2 reaches roughly 96 GiB/device and is too close to OOM.
-batch_size: 1
+batch_size: 2
 num_workers: 4
 
 model:
@@ -38,6 +38,8 @@ model:
 lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
 num_epochs: 10
+# EXPERIMENT_37 defines the budget as optimizer steps; this intentionally
+# overrides num_epochs and corresponds to about 46.1 dataset traversals.
 max_steps: 100000
 log_every: 10
 save_every: 10000
@@ -48,7 +50,7 @@ max_checkpoints: 2
 eval_every: 0
 
 # 1 sample/GPU x 8 GPUs x 16 accumulation steps keeps global batch 128.
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 8
 weight_decay: 1.0e-2
 # Action-only H3 checkpoints use the incompatible pre-Scheme-A schema.
 resume: null

@@ -77,7 +77,7 @@ def test_runtime_wires_both_schedulers_state_and_native_text(monkeypatch):
     assert captured["keyframe_condition_strength"] == 0.999
     assert captured["loss_lambda_video"] == 1.0
     assert captured["loss_lambda_action"] == 1.0
-    assert captured["stop_action_gradient_to_h3"] is True
+    assert captured["stop_action_gradient_to_h3"] is False
     assert captured["action_dit_config"]["state_dim"] == 8
     assert captured["action_dit_config"]["use_gradient_checkpointing"] is False
 
@@ -115,7 +115,7 @@ def test_h3_yaml_is_scheme_a_not_legacy_action_only():
     assert "context_dim" not in config.action_dit_config
     assert config.loss.lambda_video == 1.0
     assert config.loss.lambda_action == 1.0
-    assert config.stop_action_gradient_to_h3 is True
+    assert config.stop_action_gradient_to_h3 is False
 
 
 def test_h3_task_uses_native_prompt_path_and_no_t5_cache():

@@ -12,8 +12,8 @@
 
 1. 5-frame H3 rollout 的 2 个 prefix latent 被重复到 7 latent 后 decode，运行上可行，
    但 gold parity 只有约 18 dB，语义错误。
-2. Action loss 对早中层 H3 LoRA 的梯度远大于 video loss，第一轮 baseline 不适合
-   直接 joint optimization。
+2. Action loss 对早中层 H3 LoRA 的梯度远大于 video loss；FastWAM-like joint
+   optimization 保留该路径，但长训练必须监控 loss 和 gradient balance。
 3. LoRA checkpoint 按 list 顺序保存，缺少 module path、alpha、dropout 和 base
    checkpoint fingerprint。
 4. Qwen cache 只绑定实现版本，没有绑定真实 Qwen 权重和 processor。
@@ -82,7 +82,7 @@ CLI 现在默认保存：
 
 只有 `infer_out` 实际包含 `video` 时才写 MP4。
 
-## 3. Action loss 默认不回传 H3
+## 3. 默认采用 FastWAM-like joint gradient
 
 涉及文件：
 
@@ -96,17 +96,17 @@ CLI 现在默认保存：
 新增配置：
 
 ```yaml
-stop_action_gradient_to_h3: true
+stop_action_gradient_to_h3: false
 ```
 
-实现方式：
+默认实现：
 
 ```text
 H3 self-attention:
   使用原始 H3 K/V
 
 Action asymmetric attention:
-  使用 detach(H3 K/V)
+  使用原始 H3 K/V，不 detach
 ```
 
 因此 forward coupling 不变：
@@ -115,15 +115,17 @@ Action asymmetric attention:
 H3 -> Action
 ```
 
-但 baseline backward contract 是：
+baseline backward contract 是：
 
 ```text
 L_video  -> H3 LoRA
 L_action -> Action Expert
-L_action -/-> H3 LoRA
+L_action -> H3 LoRA
+H3 33B base weights remain frozen
 ```
 
-后续 joint gradient 可以作为显式 ablation，通过配置关闭 stop-gradient。
+这与原始 FastWAM 允许 Action loss 更新 Video Expert 的机制一致。保留
+`stop_action_gradient_to_h3=true` 作为稳定性 ablation，而不是默认 baseline。
 
 ### 3.1 真实 33B 梯度验证
 
@@ -153,8 +155,9 @@ Video-only loss:
 all observed gradients finite = true
 ```
 
-Action-only 时 H3 grad tensor 存在但全零，是 checkpointed joint graph 的结果，不会
-造成 optimizer 更新。
+以上 action-only 零梯度结果验证了可选 stop-gradient 路径。需要注意：zero tensor
+不等于 AdamW 绝对不更新，decoupled weight decay 仍可能改变进入 optimizer 的非零
+LoRA 参数；若要求 H3 绝对冻结，应将对应参数移出 optimizer。
 
 ## 4. Checkpoint schema 3
 
@@ -275,8 +278,9 @@ manifest 绑定：
 - processor/tokenizer/chat-template fingerprint
 - cache schema version
 
-每个 sample 的 filename digest 和 payload 同时绑定 Qwen 与 processor fingerprint。
-不同权重或 processor 无法误读旧 cache。
+每个 sample 的 filename digest 和 payload 同时绑定 Qwen checkpoint manifest/index 与
+processor fingerprint。它能拒绝不同 manifest/index 或 processor，但当前并未逐字节
+hash `.safetensors` shards；固定官方 release 目录是本轮训练的额外前提。
 
 sample suffix 从：
 
@@ -434,37 +438,47 @@ save
 
 已通过。
 
-## 11. 最快稳定 setting
+## 11. FastWAM-like joint-gradient 最快稳定 setting
 
 8×H20 sustained comparison：
 
 ```text
 B=1, no gradient checkpoint:
-  1.67 samples/s
+  1.75 processed samples/s (10 steps)
 
 B=1, gradient checkpoint:
-  1.51 samples/s
+  1.50 processed samples/s (3 steps)
 
 B=2, no gradient checkpoint:
-  1.58 samples/s
+  2.38 processed samples/s (10 steps)
   memory = 95.4--96.2 GiB / 97.9 GiB
+
+B=2, no gradient checkpoint, accumulation=8:
+  2.37 processed samples/s (1 full optimizer step / 8 microsteps)
 ```
+
+前三组 benchmark 显式使用 `gradient_accumulation_steps=1`；最后一组使用正式
+accumulation=8。Trainer 的通用公式现已正确计入 accumulation。
 
 选择：
 
 ```yaml
-batch_size: 1
+batch_size: 2
 model:
   mot_checkpoint_mixed_attn: false
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 8
 ```
 
 理由：
 
-- B=1 no-GC 吞吐最高。
-- 比 checkpointing 快约 10.6%。
-- B=2 吞吐反而下降。
-- B=2 仅剩约 1.7--2.4 GiB 显存，不适合长训练。
+- no-GC 比 checkpointing 快。
+- B=2 比 B=1 no-GC 快约 36%，且 10 steps 与正式 accumulation=8 都通过。
+- B=2 仅剩约 1.7--2.4 GiB 显存，长训练必须监控 OOM；若出现显存碎片或异常峰值，
+  应回退到 B=1/accumulation=16。
+
+训练预算保持 `max_steps=100000`。`EXPERIMENT_37.md` 已记录用户明确确认“总计
+100k optimizer steps，每 10k 保存一次”；因此约 46.1 次数据遍历是有意实验预算，
+不是把 `num_epochs=10` 误当成生效上限。长训练需要据验证指标监控后期 overfitting。
 
 ## 12. Checkpoint 磁盘控制
 
@@ -474,7 +488,7 @@ gradient_accumulation_steps: 16
 - `configs/task/libero_h3_uncond_2cam224_1e-4.yaml`
 - `tests/test_trainer_checkpoint_retention.py`
 
-完整 ZeRO-2 state 约 166 GiB。100k-step 实验若永久保留每个 checkpoint，会耗尽
+完整 ZeRO-2 state 约 166 GiB。长实验若永久保留每个 checkpoint，会耗尽
 本地磁盘。
 
 新增：
@@ -499,6 +513,16 @@ two full states           ~= 0.33 TiB
 
 保留策略满足预算。
 
+## 12.1 Review follow-up engineering fixes
+
+- Scheme A internal eval 显式 `decode_video=false`，只报告 val loss 以及 normalized /
+  denormalized action L1/L2；5-frame 路径不再访问不存在的 `pred["video"]`，也不调用
+  unsupported VAE pixel decode。原生可解码 window 仍保留 pixel PSNR/SSIM/MP4。
+- `samples/s` 现在乘入 `gradient_accumulation_steps`。
+- final step 若已命中周期 checkpoint，不再重复写同一份 full state。
+- dataset fallback 记录 replacement count/rate 与 exception histogram；每个 worker
+  warmup 1000 次后若 replacement rate 超过 0.1%，直接终止而不是继续掩盖系统性错误。
+
 ## 13. 自动测试
 
 最终命令：
@@ -511,7 +535,7 @@ python3 -m pytest tests -q
 结果：
 
 ```text
-85 passed, 1 warning
+88 passed, 1 warning
 ```
 
 warning 仅为环境中的 `pynvml` deprecation。
@@ -529,7 +553,8 @@ IDE diagnostics = no new code errors
 
 ## 14. 正式流水线状态
 
-已启动一个串联后台任务：
+原 stop-gradient 串联任务已停止，避免 cache 完成后按过期配置启动训练。新流水线将在
+joint-gradient 真实 8×H20 smoke test 通过后启动：
 
 ```text
 8-GPU full Qwen schema-3 cache
@@ -540,7 +565,7 @@ IDE diagnostics = no new code errors
 大训练 run id：
 
 ```text
-scheme-a-large-stopgrad-nogc-20260821
+scheme-a-large-jointgrad-b2-nogc-20260821
 ```
 
 正式 cache 使用：
@@ -551,27 +576,29 @@ cache_batch_size=1
 overwrite=false
 ```
 
-在本文档提交时，cache 仍在运行；大训练会在 cache 成功完成后自动启动。若 cache
-进程失败，shell 的 `&&` 会阻止训练启动，避免在不完整 cache 上训练。
+cache 使用 `overwrite=false` 恢复，因此停止旧进程不会丢失已完成样本。新任务中若
+cache 进程失败，shell 的 `&&` 会阻止训练启动，避免在不完整 cache 上训练。
 
 ## 15. 建议 reviewer 重点检查
 
-1. `detach_h3_for_action` 是否覆盖所有 Action 读取 H3 K/V 的路径。
+1. joint-gradient baseline 中 `L_action -> H3 LoRA` 是否在长训练保持稳定。
 2. schema-3 base fingerprint 是否需要进一步升级为完整 shard checksum。
 3. ActionDiT 每次 load 都计算 4.7 GiB SHA256 的启动成本是否可接受。
 4. `video_latents` 的 batch dimension contract 是否应统一保留。
 5. deterministic padding replacement 是否会引入可接受的数据采样偏差。
 6. full cache 接近 0.9 TiB 是否需要后续改为 shard/container 格式以降低 inode 压力。
-7. 100k optimizer steps、global batch 128 是否符合最终训练预算与数据 epoch 规划。
+7. 100k optimizer steps（约 46.1 次数据遍历）的后期 overfitting 与 checkpoint 指标。
 
 ## 16. 当前结论
 
 已确认：
 
 - 5-frame 错误 pixel decode 不再出现在默认生产路径。
-- Action baseline 不再用巨大 action gradient 更新 H3 LoRA。
+- baseline 恢复原始 FastWAM-like joint gradient；H3 base 冻结，仅 LoRA 接收
+  `L_video + L_action`。
 - named LoRA schema-3 checkpoint 可严格恢复。
-- ActionDiT 与 Qwen cache 都绑定真实 artifact fingerprint。
+- ActionDiT 绑定真实字节 SHA256；Qwen cache 绑定 checkpoint manifest/index 与
+  processor fingerprint。
 - 192 Hz 是显式且可验证的等效 RoPE clock。
 - 真实 8×H20 optimizer step 成功。
 - 真实新进程 full-state resume step 成功。
@@ -580,5 +607,6 @@ overwrite=false
 
 仍在进行：
 
-- 277,713-window 全量 Qwen cache。
+- joint-gradient 真实 8×H20 smoke test。
+- 277,713-window 全量 Qwen cache（从已有样本恢复）。
 - cache 完成后自动启动的大规模训练。

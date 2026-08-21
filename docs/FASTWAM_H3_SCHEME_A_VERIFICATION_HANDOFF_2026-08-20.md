@@ -1180,15 +1180,15 @@ decode_video=true
 
 仅在输出确实包含 pixel video 时才保存 MP4。
 
-### 22.2 第一轮 baseline 默认 stop-gradient Action loss -> H3
+### 22.2 第一轮 baseline 恢复 FastWAM-like joint gradient
 
 新增配置：
 
 ```yaml
-stop_action_gradient_to_h3: true
+stop_action_gradient_to_h3: false
 ```
 
-实现只对 Action attention 使用的 H3 K/V 做 detach：
+默认不对 Action attention 使用的 H3 K/V 做 detach：
 
 ```text
 forward:
@@ -1197,7 +1197,8 @@ forward:
 backward:
   L_video  -> H3 LoRA
   L_action -> Action Expert
-  L_action -/-> H3 LoRA
+  L_action -> H3 LoRA
+  H3 base 33B remains frozen
 ```
 
 真实 33B、真实 LIBERO 样本验证：
@@ -1218,8 +1219,9 @@ Video-only loss:
 all gradients finite = true
 ```
 
-零梯度 tensor 来自 joint checkpoint graph，不代表参数被更新。optimizer step 下只有
-non-zero 路径产生更新。
+以上零梯度结果验证的是仍然保留的可选 stop-gradient 路径。需要注意，zero tensor
+并不保证 AdamW 完全不更新参数，decoupled weight decay 仍可能生效；要求绝对冻结时
+应将 H3 LoRA 移出 optimizer。
 
 ### 22.3 Checkpoint schema 3
 
@@ -1294,8 +1296,9 @@ cache directory 现在必须包含 manifest，并记录：
 - hidden layer
 - schema version
 
-每个 sample digest 和 payload 都绑定这两个 artifact fingerprint。相同代码但不同 Qwen
-权重、processor 或 tokenizer 不再能误读旧 cache。
+每个 sample digest 和 payload 都绑定 Qwen checkpoint manifest/index 与 processor
+fingerprint。不同 manifest/index、processor 或 tokenizer 不能误读旧 cache；当前尚未
+逐字节 hash `.safetensors` shards，因此训练依赖固定且不可修改的官方 release 目录。
 
 已用真实 Qwen-32B 和真实 LIBERO 样本成功生成一个 schema-3 cache sample。完整 cache
 正在重新生成。
@@ -1317,7 +1320,7 @@ video_fps * action_horizon / (num_frames - 1)
 本轮修改后的 H3 测试：
 
 ```text
-85 passed, 1 warning
+88 passed, 1 warning
 ```
 
 warning 仍只是环境中的 `pynvml` deprecation。
@@ -1381,32 +1384,43 @@ precompute 新增：
 真实完整 dataset 长度是 `277,713` 个窗口，不是 normalization 日志里的 1,712 个
 episode。按真实速度估计，全量 cache 约需 19 小时，预计占用约 0.9 TiB。
 
-### 22.10 最快稳定 setting
+### 22.10 FastWAM-like joint-gradient 最快稳定 setting
 
 8×H20 sustained benchmark：
 
 ```text
 B=1, no gradient checkpoint:
-  1.67 samples/s
+  1.75 processed samples/s (10 steps)
 
 B=1, gradient checkpoint:
-  1.51 samples/s
+  1.50 processed samples/s (3 steps)
 
 B=2, no gradient checkpoint:
-  1.58 samples/s
+  2.38 processed samples/s (10 steps)
   GPU memory = 95.4--96.2 GiB / 97.9 GiB
+
+B=2, no gradient checkpoint, accumulation=8:
+  2.37 processed samples/s (1 full optimizer step / 8 microsteps)
 ```
+
+前三组 benchmark 显式设置 accumulation=1；最后一组使用正式 accumulation=8。
+Trainer 的通用统计公式现已正确计入 accumulation。
 
 结论：
 
 ```text
-batch_size = 1
+batch_size = 2
 mot_checkpoint_mixed_attn = false
-gradient_accumulation_steps = 16
+gradient_accumulation_steps = 8
 ```
 
-是当前最快且有合理显存余量的正式训练 setting。B=2 不仅吞吐更低，而且只剩约
-1.7--2.4 GiB 显存余量，不适合作为长训练配置。
+是当前实测最快的正式训练 setting，比 B=1 no-GC 快约 36%，同时保持 global batch
+128。B=2 只剩约 1.7--2.4 GiB 显存余量；10-step 和 accumulation=8 smoke 均成功，
+长训练仍需监控，若出现 OOM 则回退到 B=1/accumulation=16。
+
+正式预算保持 `max_steps=100000`。`EXPERIMENT_37.md` 已记录用户明确确认总计
+100k optimizer steps、每 10k 保存一次；约 46.1 次数据遍历是有意设计，而不是
+`num_epochs=10` 应当生效但被意外覆盖。
 
 ### 22.11 Checkpoint 磁盘保留策略
 
@@ -1417,11 +1431,13 @@ max_checkpoints: 2
 ```
 
 每次 checkpoint 完成后只保留最新两个 full states 和最新两个 named schema-3 weights，
-防止 100k-step 实验因 checkpoint 累积耗尽磁盘。
+防止长实验因 checkpoint 累积耗尽磁盘。最终 step 若已命中周期 checkpoint，也不再
+重复写入同一份约 166 GiB state。
 
 ### 22.12 正式实验状态
 
-正式流水线已启动：
+原 stop-gradient 流水线已停止，防止按过期配置自动启动。joint-gradient smoke test
+通过后将恢复已有 cache 并启动：
 
 ```text
 full schema-3 Qwen cache
@@ -1432,5 +1448,5 @@ full schema-3 Qwen cache
 大训练 run id：
 
 ```text
-scheme-a-large-stopgrad-nogc-20260821
+scheme-a-large-jointgrad-b2-nogc-20260821
 ```

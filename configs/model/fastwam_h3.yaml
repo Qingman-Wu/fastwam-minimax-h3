@@ -17,9 +17,9 @@ freeze_video_expert: true
 h3_lora_rank: 32
 h3_lora_alpha: 32.0
 h3_lora_dropout: 0.0
-# Baseline optimization is jointly coupled in the forward pass but isolates
-# H3 LoRA from the initially dominant action-loss gradient.
-stop_action_gradient_to_h3: true
+# Match original FastWAM optimization: Action reads H3 K/V and its loss can
+# update the H3 attention LoRA. The 33B H3 base weights remain frozen.
+stop_action_gradient_to_h3: false
 
 # Full MiniMax H3 FL2VA video expert. These values are checked against
 # FL2VA/transformer/config.json at load time.

@@ -176,7 +176,7 @@ def create_fastwam_h3(
     h3_lora_rank: int = 0,
     h3_lora_alpha: float = 32.0,
     h3_lora_dropout: float = 0.0,
-    stop_action_gradient_to_h3: bool = True,
+    stop_action_gradient_to_h3: bool = False,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):

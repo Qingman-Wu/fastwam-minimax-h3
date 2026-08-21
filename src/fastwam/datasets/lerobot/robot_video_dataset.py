@@ -1,5 +1,6 @@
 import hashlib
 import os
+from collections import Counter
 from typing import Optional
 import time
 import numpy as np
@@ -18,7 +19,7 @@ from ..h3_condition_cache import (
     collate_h3_condition_samples,
     load_h3_condition_cache,
 )
-from ..padding import fetch_unpadded_temporal_sample
+from ..padding import fetch_unpadded_temporal_sample, validate_replacement_rate
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
 from accelerate import PartialState
@@ -46,6 +47,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
+        max_replacement_rate: float = 0.001,
+        replacement_rate_warmup: int = 1000,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
     ):
@@ -85,6 +88,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
+        self.max_replacement_rate = float(max_replacement_rate)
+        self.replacement_rate_warmup = int(replacement_rate_warmup)
+        if not 0.0 <= self.max_replacement_rate <= 1.0:
+            raise ValueError("`max_replacement_rate` must be between 0 and 1")
+        if self.replacement_rate_warmup < 1:
+            raise ValueError("`replacement_rate_warmup` must be positive")
+        self.sample_attempt_count = 0
+        self.replacement_count = 0
+        self.replacement_exception_types = Counter()
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
 
@@ -283,7 +295,31 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         return context, context_mask
 
+    def _record_replacement(self, error: Exception):
+        self.replacement_count += 1
+        self.replacement_exception_types[type(error).__name__] += 1
+        summary = dict(self.replacement_exception_types.most_common())
+        try:
+            replacement_rate = validate_replacement_rate(
+                replacement_count=self.replacement_count,
+                sample_attempt_count=self.sample_attempt_count,
+                max_replacement_rate=self.max_replacement_rate,
+                replacement_rate_warmup=self.replacement_rate_warmup,
+                exception_types=summary,
+            )
+        except RuntimeError as safety_error:
+            raise safety_error from error
+        if self.replacement_count == 1 or self.replacement_count % 10 == 0:
+            logger.warning(
+                "Dataset replacements=%d/%d (%.4f%%), exceptions=%s",
+                self.replacement_count,
+                self.sample_attempt_count,
+                replacement_rate * 100.0,
+                summary,
+            )
+
     def __getitem__(self, idx):
+        self.sample_attempt_count += 1
         try:
             data = self._get(idx)
         except FileNotFoundError:
@@ -291,6 +327,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             # sample. Random substitution only hides incomplete cache jobs.
             raise
         except Exception as e:
+            self._record_replacement(e)
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
             print(traceback.format_exc())

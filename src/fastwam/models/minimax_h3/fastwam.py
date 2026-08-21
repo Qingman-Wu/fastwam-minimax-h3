@@ -67,7 +67,7 @@ class FastWAMH3(nn.Module):
         h3_lora_rank: int = 0,
         h3_lora_alpha: float = 32.0,
         h3_lora_dropout: float = 0.0,
-        stop_action_gradient_to_h3: bool = True,
+        stop_action_gradient_to_h3: bool = False,
         base_h3_fingerprint: str = "unavailable",
     ) -> None:
         super().__init__()
@@ -158,7 +158,7 @@ class FastWAMH3(nn.Module):
         h3_lora_rank: int = 0,
         h3_lora_alpha: float = 32.0,
         h3_lora_dropout: float = 0.0,
-        stop_action_gradient_to_h3: bool = True,
+        stop_action_gradient_to_h3: bool = False,
     ) -> "FastWAMH3":
         model_path = Path(model_path)
         video_expert = load_h3_video_backbone(

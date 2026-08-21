@@ -13,6 +13,30 @@ TEMPORAL_PADDING_KEYS = (
 )
 
 
+def validate_replacement_rate(
+    *,
+    replacement_count: int,
+    sample_attempt_count: int,
+    max_replacement_rate: float,
+    replacement_rate_warmup: int,
+    exception_types: Mapping[str, int],
+) -> float:
+    """Return the replacement rate or fail when corruption is systematic."""
+
+    replacement_rate = replacement_count / sample_attempt_count
+    if (
+        sample_attempt_count >= replacement_rate_warmup
+        and replacement_rate > max_replacement_rate
+    ):
+        raise RuntimeError(
+            "Dataset replacement rate exceeded the configured safety limit: "
+            f"{replacement_count}/{sample_attempt_count} "
+            f"({replacement_rate:.4%}) > {max_replacement_rate:.4%}; "
+            f"exceptions={dict(exception_types)}"
+        )
+    return replacement_rate
+
+
 def _has_temporal_padding(sample: Mapping[str, Any]) -> bool:
     missing = [key for key in TEMPORAL_PADDING_KEYS if key not in sample]
     if missing:

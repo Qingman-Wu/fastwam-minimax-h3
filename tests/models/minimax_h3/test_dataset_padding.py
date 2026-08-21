@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from fastwam.datasets.padding import fetch_unpadded_temporal_sample
+from fastwam.datasets.padding import (
+    fetch_unpadded_temporal_sample,
+    validate_replacement_rate,
+)
 
 
 def padded_sample(is_padded):
@@ -48,3 +51,14 @@ def test_padding_retry_never_silently_returns_padding_after_budget_exhausted():
         )
 
     assert calls == 3
+
+
+def test_dataset_replacement_rate_fails_above_safety_limit():
+    with pytest.raises(RuntimeError, match="replacement rate exceeded"):
+        validate_replacement_rate(
+            replacement_count=2,
+            sample_attempt_count=1000,
+            max_replacement_rate=0.001,
+            replacement_rate_warmup=1000,
+            exception_types={"ValueError": 1, "TypeError": 1},
+        )
