@@ -166,10 +166,12 @@ def load_h3_condition_cache(
     manifest = _load_cache_manifest(cache_dir)
     path = h3_condition_cache_path(cache_dir, first_frame, instruction)
     if not path.is_file():
-        raise FileNotFoundError(
+        error = FileNotFoundError(
             f"Missing native H3 condition cache: {path}. "
             "Run scripts/precompute_h3_conditions.py first."
         )
+        error.filename = str(path)
+        raise error
     return load_h3_condition_cache_file(path, manifest=manifest)
 
 
@@ -193,13 +195,35 @@ def load_h3_condition_cache_file(
     ):
         raise ValueError(f"Incompatible H3 condition cache schema in {path}")
     embeddings = payload["prompt_embeds"]
-    token_tags = payload["prompt_token_tags"].to(torch.long)
-    if embeddings.ndim != 2 or embeddings.shape[-1] != H3_QWEN_WIDTH:
+    raw_token_tags = payload["prompt_token_tags"]
+    if (
+        not isinstance(embeddings, torch.Tensor)
+        or embeddings.ndim != 2
+        or embeddings.shape[0] <= 0
+        or embeddings.shape[-1] != H3_QWEN_WIDTH
+    ):
         raise ValueError(f"Invalid H3 cached embedding shape in {path}")
-    if token_tags.shape != embeddings.shape[:1]:
+    if not torch.is_floating_point(embeddings):
+        raise ValueError(f"H3 cached embeddings must be floating point in {path}")
+    if not torch.isfinite(embeddings).all():
+        raise ValueError(f"H3 cached embeddings contain non-finite values in {path}")
+    integer_dtypes = {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+    if (
+        not isinstance(raw_token_tags, torch.Tensor)
+        or raw_token_tags.dtype not in integer_dtypes
+    ):
+        raise ValueError(f"H3 cached modality tags must use an integer dtype in {path}")
+    if raw_token_tags.shape != embeddings.shape[:1]:
         raise ValueError(f"Invalid H3 cached tag shape in {path}")
-    if not torch.logical_or(token_tags == 0, token_tags == 1).all():
+    if not torch.logical_or(raw_token_tags == 0, raw_token_tags == 1).all():
         raise ValueError(f"Invalid H3 cached modality tags in {path}")
+    token_tags = raw_token_tags.to(torch.long)
     return {
         "prompt_embeds": embeddings,
         "prompt_token_tags": token_tags,

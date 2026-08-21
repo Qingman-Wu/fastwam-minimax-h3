@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from fastwam.datasets.h3_condition_cache import (
@@ -55,6 +56,21 @@ def test_h3_condition_cache_round_trip_preserves_native_rows(tmp_path):
     assert loaded["prompt_attention_mask"].tolist() == [True, True, True]
 
 
+def test_h3_condition_cache_miss_exposes_exact_missing_filename(tmp_path):
+    initialize(tmp_path)
+
+    with pytest.raises(FileNotFoundError) as captured:
+        load_h3_condition_cache(
+            tmp_path,
+            first_frame=torch.zeros(3, 4, 4),
+            instruction="missing",
+        )
+
+    assert captured.value.filename.endswith(
+        ".h3-qwen-prenorm-layer50-v3.pt"
+    )
+
+
 def test_h3_condition_cache_manifest_rejects_different_qwen_weights(tmp_path):
     initialize(tmp_path)
 
@@ -92,6 +108,53 @@ def test_direct_cache_file_loader_strictly_validates_manifest(tmp_path):
         assert "schema" in str(error)
     else:
         raise AssertionError("Direct file audit must reject a manifest mismatch")
+
+
+def _make_cache_file(tmp_path):
+    manifest = initialize_h3_condition_cache(
+        tmp_path,
+        qwen_checkpoint_fingerprint="sha256:qwen-a",
+        processor_fingerprint="sha256:processor-a",
+    )
+    path = save_h3_condition_cache(
+        tmp_path,
+        first_frame=torch.zeros(3, 4, 4),
+        instruction="move",
+        embeddings=torch.zeros(2, 5120),
+        token_tags=torch.tensor([1, 0]),
+    )
+    return path, manifest
+
+
+def test_direct_cache_file_loader_rejects_empty_embeddings(tmp_path):
+    path, manifest = _make_cache_file(tmp_path)
+    payload = torch.load(path, weights_only=True)
+    payload["prompt_embeds"] = torch.empty(0, 5120)
+    payload["prompt_token_tags"] = torch.empty(0, dtype=torch.long)
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match="embedding shape"):
+        load_h3_condition_cache_file(path, manifest=manifest)
+
+
+def test_direct_cache_file_loader_rejects_nonfinite_embeddings(tmp_path):
+    path, manifest = _make_cache_file(tmp_path)
+    payload = torch.load(path, weights_only=True)
+    payload["prompt_embeds"][0, 0] = float("nan")
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match="non-finite"):
+        load_h3_condition_cache_file(path, manifest=manifest)
+
+
+def test_direct_cache_file_loader_rejects_float_tags_before_cast(tmp_path):
+    path, manifest = _make_cache_file(tmp_path)
+    payload = torch.load(path, weights_only=True)
+    payload["prompt_token_tags"] = torch.tensor([1.0, 0.5])
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match="integer dtype"):
+        load_h3_condition_cache_file(path, manifest=manifest)
 
 
 def test_h3_condition_collate_pads_variable_qwen_lengths_without_valid_padding():

@@ -816,15 +816,27 @@ Time padding and padded action dimensions are both excluded.
 `scripts/audit_h3_condition_cache.py` performs both required audit layers:
 
 1. enumerate every unique schema-3 cache file and strictly validate that it is
-   readable, matches the manifest, has width 5120, and has valid modality tags;
+   readable, matches the manifest, has a nonempty finite floating-point
+   `[L,5120]` embedding, and has exact integer modality tags in `{0,1}`;
 2. instantiate the production dataset and visit every one of its 277,713
-   indices, proving that each training sample resolves to a valid cache entry.
+   original indices through `get_strict()`, proving that each requested sample
+   resolves to its own valid cache entry without `__getitem__` replacement.
 
 The report contains unique-file and sample-reference row-length histograms,
 both maxima, unique referenced-file count, missing/orphan counts, replacement
-telemetry, and separate `passed` and `formal_gate_passed` fields. The formal
-gate is true only when both scans are complete, not when a smoke-test subset
-passes.
+telemetry, and separate gates:
+
+- `formal_cache_gate_passed`: both strict scans are complete, all expected
+  samples succeeded, and replacement count is zero;
+- `b2_memory_gate_passed`: observed `max_rows` does not exceed the configured
+  `b2_verified_max_rows` default of 140;
+- `requires_memory_resmoke`: cache integrity passed but B=2 requires a new
+  exact-length smoke;
+- `formal_gate_passed`: both cache integrity and B=2 memory gates passed.
+
+Production mode exits nonzero unless `formal_gate_passed=true`. Partial smoke
+requires the explicit `cache_audit.allow_partial=true` override, so a subset
+cannot accidentally satisfy an automated production launch chain.
 
 The intended post-cache command is:
 
@@ -837,12 +849,14 @@ torchrun --standalone --nproc_per_node=8 \
   +cache_audit.output_path=artifacts/h3_condition_cache_full_audit.json
 ```
 
-If either reported maximum exceeds 140, B=2 is blocked until
-`scripts/smoke_h3_b2_memory.py` passes with that exact maximum row length.
+If either reported maximum exceeds 140, the script sets the B=2 gate false and
+exits nonzero until `scripts/smoke_h3_b2_memory.py` passes with that exact
+maximum row length and the verified limit is explicitly updated.
 
-A live partial smoke audited four unique files and two dataset references. It
-correctly found dataset length 277,713, schema 3, valid 140-row references, no
-errors, `passed=true`, and `formal_gate_passed=false`.
+A strict live partial smoke audited four unique files and two original dataset
+references. It correctly found dataset length 277,713, schema 3, valid 140-row
+references, no replacements/errors, `passed=true`,
+`formal_cache_gate_passed=false`, and `formal_gate_passed=false`.
 
 ### 17.3 Continuous 1k/5k canary boundaries
 

@@ -295,6 +295,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         return context, context_mask
 
+    def get_strict(self, idx):
+        """Return the requested index without training-time replacement."""
+
+        return self._get(idx)
+
     def _record_replacement(self, error: Exception):
         self.replacement_count += 1
         self.replacement_exception_types[type(error).__name__] += 1
