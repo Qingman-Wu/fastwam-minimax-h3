@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +13,28 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from .video_dit import H3RoPE
+
+
+def _validate_action_artifact_manifest(path: Path) -> None:
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing H3 ActionDiT artifact manifest: {manifest_path}"
+        )
+    manifest = json.loads(manifest_path.read_text())
+    artifact = manifest.get("artifact", {})
+    if (
+        manifest.get("schema_version") != 1
+        or artifact.get("filename") != path.name
+        or int(artifact.get("size_bytes", -1)) != path.stat().st_size
+    ):
+        raise ValueError(f"Invalid H3 ActionDiT artifact manifest: {manifest_path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    if artifact.get("sha256") != digest.hexdigest():
+        raise ValueError(f"H3 ActionDiT artifact checksum mismatch: {path}")
 
 
 class H3RMSNorm(nn.Module):
@@ -356,7 +380,9 @@ class H3ActionDiT(nn.Module):
         model = cls(**action_dit_config).to(device=device, dtype=dtype)
         if skip_load or pretrained_path is None:
             return model
-        payload = torch.load(Path(pretrained_path), map_location="cpu", weights_only=False)
+        pretrained_path = Path(pretrained_path)
+        _validate_action_artifact_manifest(pretrained_path)
+        payload = torch.load(pretrained_path, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict) or not isinstance(
             payload.get("backbone_state_dict"), dict
         ):

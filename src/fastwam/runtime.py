@@ -171,11 +171,12 @@ def create_fastwam_h3(
     mot_checkpoint_mixed_attn: bool = True,
     keyframe_condition_strength: float = 0.999,
     video_fps: float = 24.0,
-    action_fps: float = 8.0,
+    action_fps: float | None = None,
     freeze_video_expert: bool = True,
     h3_lora_rank: int = 0,
     h3_lora_alpha: float = 32.0,
     h3_lora_dropout: float = 0.0,
+    stop_action_gradient_to_h3: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -257,11 +258,12 @@ def create_fastwam_h3(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         video_fps=float(video_fps),
-        action_fps=float(action_fps),
+        action_fps=None if action_fps is None else float(action_fps),
         freeze_video_expert=bool(freeze_video_expert),
         h3_lora_rank=int(h3_lora_rank),
         h3_lora_alpha=float(h3_lora_alpha),
         h3_lora_dropout=float(h3_lora_dropout),
+        stop_action_gradient_to_h3=bool(stop_action_gradient_to_h3),
     )
 
 
@@ -612,6 +614,9 @@ def run_inference(cfg: DictConfig):
                 expected_state_dim=int(model.action_expert.state_dim),
             )
         )
+        infer_kwargs["decode_video"] = bool(
+            inference_cfg.get("decode_video", False)
+        )
         h3_cache_dir = inference_cfg.get("h3_condition_cache_dir")
         if h3_cache_dir is not None:
             from .datasets.h3_condition_cache import load_h3_condition_cache
@@ -648,12 +653,14 @@ def run_inference(cfg: DictConfig):
         enabled=autocast_enabled,
     ):
         infer_out = model.infer(**infer_kwargs)
-    video = infer_out["video"]
-    output_fps = int(
-        inference_cfg.get("fps", getattr(model, "video_fps", 15))
-    )
-    save_mp4(video, output_mp4, fps=output_fps)
-    logger.info("Saved inference video to %s", output_mp4)
+    video_path = None
+    if "video" in infer_out:
+        output_fps = int(
+            inference_cfg.get("fps", getattr(model, "video_fps", 15))
+        )
+        save_mp4(infer_out["video"], output_mp4, fps=output_fps)
+        logger.info("Saved inference video to %s", output_mp4)
+        video_path = output_mp4
     if is_h3:
         output_action = inference_cfg.get("output_action")
         action_path = (
@@ -664,8 +671,12 @@ def run_inference(cfg: DictConfig):
         action_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(infer_out["action"], action_path)
         logger.info("Saved primary H3 action prediction to %s", action_path)
+        latent_path = Path(output_mp4).with_suffix(".video_latents.pt")
+        torch.save(infer_out["video_latents"], latent_path)
+        logger.info("Saved H3 video latent rollout to %s", latent_path)
         return {
-            "video_path": output_mp4,
+            "video_path": video_path,
+            "video_latents_path": str(latent_path),
             "action_path": str(action_path),
             "action": infer_out["action"],
         }

@@ -77,6 +77,7 @@ def test_runtime_wires_both_schedulers_state_and_native_text(monkeypatch):
     assert captured["keyframe_condition_strength"] == 0.999
     assert captured["loss_lambda_video"] == 1.0
     assert captured["loss_lambda_action"] == 1.0
+    assert captured["stop_action_gradient_to_h3"] is True
     assert captured["action_dit_config"]["state_dim"] == 8
     assert captured["action_dit_config"]["use_gradient_checkpointing"] is False
 
@@ -114,6 +115,7 @@ def test_h3_yaml_is_scheme_a_not_legacy_action_only():
     assert "context_dim" not in config.action_dit_config
     assert config.loss.lambda_video == 1.0
     assert config.loss.lambda_action == 1.0
+    assert config.stop_action_gradient_to_h3 is True
 
 
 def test_h3_task_uses_native_prompt_path_and_no_t5_cache():
@@ -182,7 +184,10 @@ def test_h3_cli_inference_passes_state_and_persists_primary_action(
 
         def infer(self, **kwargs):
             self.kwargs = kwargs
-            return {"video": [object()], "action": torch.arange(6).view(2, 3)}
+            return {
+                "video_latents": torch.ones(2, 2, 2, 2),
+                "action": torch.arange(6).view(2, 3),
+            }
 
     model = FakeH3Model()
     saved_video = {}
@@ -221,8 +226,10 @@ def test_h3_cli_inference_passes_state_and_persists_primary_action(
     assert model.kwargs["action_horizon"] == 2
     assert model.kwargs["proprio"].shape == (4,)
     assert "action" not in model.kwargs
-    assert saved_video["fps"] == 24
-    assert result["video_path"] == str(output_mp4)
+    assert model.kwargs["decode_video"] is False
+    assert saved_video == {}
+    assert result["video_path"] is None
+    assert result["video_latents_path"].endswith("aux.video_latents.pt")
     assert result["action_path"].endswith("aux.action.pt")
     assert torch.equal(
         torch.load(result["action_path"], weights_only=True),

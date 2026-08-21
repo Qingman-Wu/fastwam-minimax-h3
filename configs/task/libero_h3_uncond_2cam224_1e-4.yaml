@@ -18,8 +18,8 @@ data:
     skip_padding_as_possible: true
     max_padding_retry: 50
 
-# Real 33B smoke peaks near 90 GiB with B=1 and checkpointing on. Larger
-# per-device batches are unsafe until optimizer/offload work lands.
+# B=1 without mixed-attention activation checkpointing is the fastest stable
+# 8xH20 setting. B=2 reaches roughly 96 GiB/device and is too close to OOM.
 batch_size: 1
 num_workers: 4
 
@@ -27,7 +27,9 @@ model:
   # Training reads exact Qwen layer-50 f0+instruction rows from the native
   # cache so the 32B encoder and H3 Video Expert never share one GPU.
   load_text_encoder: false
-  mot_checkpoint_mixed_attn: true
+  # Sustained 8xH20 benchmark: 1.67 samples/s without checkpointing versus
+  # 1.51 samples/s with checkpointing. B=1 retains safe memory headroom.
+  mot_checkpoint_mixed_attn: false
   # The 32 action rows cover the four transitions of five visual frames.
   # On H3's native 24-fps RoPE clock, eight controls per visual interval
   # therefore correspond to an effective action rate of 24 * 8 = 192.
@@ -39,6 +41,9 @@ num_epochs: 10
 max_steps: 100000
 log_every: 10
 save_every: 10000
+# A full ZeRO-2 state is about 166 GiB. Retain only the newest two states and
+# weights so the cache plus checkpoints stay within the local 2.5 TiB budget.
+max_checkpoints: 2
 # Full-video and action flow-matching losses are both active in Scheme A.
 eval_every: 0
 

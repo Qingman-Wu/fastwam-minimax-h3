@@ -16,9 +16,13 @@ from tqdm import tqdm
 
 from fastwam.datasets.h3_condition_cache import (
     h3_condition_cache_path,
+    initialize_h3_condition_cache,
     save_h3_condition_cache,
 )
-from fastwam.models.minimax_h3.text_encoder import MiniMaxH3TextConditioner
+from fastwam.models.minimax_h3.text_encoder import (
+    MiniMaxH3TextConditioner,
+    h3_qwen_artifact_fingerprints,
+)
 from fastwam.utils.config_resolvers import register_default_resolvers
 from fastwam.utils.logging_config import setup_logging
 
@@ -60,6 +64,18 @@ def main(cfg: DictConfig) -> None:
     dataset_config["h3_condition_cache_dir"] = None
     dataset_config["text_embedding_cache_dir"] = None
     dataset = instantiate(dataset_config)
+    overwrite = bool(cfg.get("overwrite", False))
+    fingerprints = h3_qwen_artifact_fingerprints(
+        Path(str(cfg.model.model_path))
+    )
+    if rank == 0:
+        initialize_h3_condition_cache(
+            cache_dir,
+            overwrite=overwrite,
+            **fingerprints,
+        )
+    if dist.is_initialized():
+        dist.barrier()
 
     if not torch.cuda.is_available():
         raise RuntimeError("H3 Qwen condition precomputation requires CUDA")
@@ -69,39 +85,65 @@ def main(cfg: DictConfig) -> None:
         device=device,
         dtype=torch.bfloat16,
     )
-    overwrite = bool(cfg.get("overwrite", False))
     max_samples = cfg.get("max_samples")
     sample_count = len(dataset)
     if max_samples is not None:
         sample_count = min(sample_count, int(max_samples))
-    indices = range(rank, sample_count, world_size)
+    sampler_seed = cfg.get("sampler_seed")
+    if sampler_seed is None:
+        indices = list(range(rank, sample_count, world_size))
+    else:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(sampler_seed))
+        smoke_indices = torch.randperm(
+            len(dataset), generator=generator
+        )[:sample_count].tolist()
+        indices = smoke_indices[rank::world_size]
+    cache_batch_size = int(cfg.get("cache_batch_size", 1))
+    if cache_batch_size <= 0:
+        raise ValueError("cache_batch_size must be positive")
     progress = tqdm(
-        indices,
-        total=(sample_count + world_size - 1 - rank) // world_size,
+        total=len(indices),
         disable=rank != 0,
         desc="H3 Qwen layer-50 cache",
     )
     written = 0
     skipped = 0
-    for index in progress:
-        sample = dataset[index]
-        first_frame = sample["video"][:, 0]
-        instruction = str(sample["prompt"])
-        path = h3_condition_cache_path(cache_dir, first_frame, instruction)
-        if path.is_file() and not overwrite:
-            skipped += 1
-            continue
-        batch = conditioner.encode([_to_pil(first_frame)], [instruction])
-        save_h3_condition_cache(
-            cache_dir,
-            first_frame=first_frame,
-            instruction=instruction,
-            embeddings=batch.embeddings,
-            token_tags=batch.token_tags,
-        )
-        written += 1
+    for start in range(0, len(indices), cache_batch_size):
+        pending = []
+        seen_paths: set[Path] = set()
+        batch_indices = indices[start : start + cache_batch_size]
+        for index in batch_indices:
+            sample = dataset[index]
+            first_frame = sample["video"][:, 0]
+            instruction = str(sample["prompt"])
+            path = h3_condition_cache_path(cache_dir, first_frame, instruction)
+            if (path.is_file() and not overwrite) or path in seen_paths:
+                skipped += 1
+                continue
+            seen_paths.add(path)
+            pending.append((first_frame, instruction))
+        if pending:
+            batch = conditioner.encode(
+                [_to_pil(item[0]) for item in pending],
+                [item[1] for item in pending],
+            )
+            offsets = batch.cu_seqlens.detach().cpu().tolist()
+            for item_index, (first_frame, instruction) in enumerate(pending):
+                row_start = int(offsets[item_index])
+                row_end = int(offsets[item_index + 1])
+                save_h3_condition_cache(
+                    cache_dir,
+                    first_frame=first_frame,
+                    instruction=instruction,
+                    embeddings=batch.embeddings[row_start:row_end],
+                    token_tags=batch.token_tags[row_start:row_end],
+                )
+                written += 1
+        progress.update(len(batch_indices))
         if rank == 0:
             progress.set_postfix(written=written, skipped=skipped)
+    progress.close()
 
     if dist.is_initialized():
         dist.barrier()

@@ -1,24 +1,55 @@
+import hashlib
+import json
+
 import pytest
 import torch
 
 from fastwam.models.minimax_h3.action_dit import H3ActionDiT
 
 
+def tiny_action_config(num_layers=0):
+    return {
+        "action_dim": 3,
+        "state_dim": 5,
+        "hidden_size": 8,
+        "ffn_hidden_size": 16,
+        "num_layers": num_layers,
+        "num_attention_heads": 2,
+        "attention_head_dim": 8,
+        "timestep_input_dim": 4,
+        "time_embed_hidden_size": 8,
+        "time_embed_dim": 8,
+        "rope_inv_freq_len": 1,
+        "use_gradient_checkpointing": False,
+    }
+
+
 def make_tiny_action_dit(num_layers=0):
-    return H3ActionDiT(
-        action_dim=3,
-        state_dim=5,
-        hidden_size=8,
-        ffn_hidden_size=16,
-        num_layers=num_layers,
-        num_attention_heads=2,
-        attention_head_dim=8,
-        timestep_input_dim=4,
-        time_embed_hidden_size=8,
-        time_embed_dim=8,
-        rope_inv_freq_len=1,
-        use_gradient_checkpointing=False,
-    ).eval()
+    return H3ActionDiT(**tiny_action_config(num_layers)).eval()
+
+
+def write_artifact_with_manifest(path):
+    model = make_tiny_action_dit()
+    state = model.state_dict()
+    payload = {
+        "meta": {key: getattr(model, key) for key in model.META_KEYS},
+        "backbone_state_dict": {
+            key: state[key] for key in model.backbone_key_set(state)
+        },
+    }
+    torch.save(payload, path)
+    manifest = {
+        "schema_version": 1,
+        "artifact": {
+            "filename": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        },
+    }
+    path.with_suffix(path.suffix + ".manifest.json").write_text(
+        json.dumps(manifest)
+    )
+    return model
 
 
 def test_state_is_one_prefix_row_and_head_returns_only_actions():
@@ -96,3 +127,39 @@ def test_action_expert_forward_returns_no_state_prediction():
     prediction = model(action, state, torch.tensor([0.2, 0.8]))
 
     assert prediction.shape == action.shape
+
+
+def test_action_artifact_requires_and_validates_manifest(tmp_path):
+    path = tmp_path / "action.pt"
+    expected = write_artifact_with_manifest(path)
+
+    loaded = H3ActionDiT.from_pretrained(
+        tiny_action_config(),
+        path,
+        dtype=torch.float32,
+    )
+
+    for key in expected.backbone_key_set(expected.state_dict()):
+        assert torch.equal(loaded.state_dict()[key], expected.state_dict()[key])
+
+
+def test_action_artifact_rejects_missing_manifest(tmp_path):
+    path = tmp_path / "action.pt"
+    model = make_tiny_action_dit()
+    torch.save(
+        {
+            "meta": {key: getattr(model, key) for key in model.META_KEYS},
+            "backbone_state_dict": {
+                key: model.state_dict()[key]
+                for key in model.backbone_key_set(model.state_dict())
+            },
+        },
+        path,
+    )
+
+    with pytest.raises(FileNotFoundError, match="artifact manifest"):
+        H3ActionDiT.from_pretrained(
+            tiny_action_config(),
+            path,
+            dtype=torch.float32,
+        )

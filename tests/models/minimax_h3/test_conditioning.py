@@ -259,16 +259,13 @@ def test_h3_native_temporal_latent_length(num_frames, latent_frames):
     assert MiniMaxH3VAEAdapter.latent_temporal_length(num_frames) == latent_frames
 
 
-def test_five_frame_decode_pads_to_one_runtime_temporal_window():
+def test_five_frame_pixel_decode_rejects_two_prefix_latents():
     adapter = make_tiny_vae_adapter()
 
-    decoded = adapter.decode(torch.zeros(1, 24, 2, 2, 2), frame_num=5)
+    with pytest.raises(NotImplementedError, match="cannot faithfully decode"):
+        adapter.decode(torch.zeros(1, 24, 2, 2, 2), frame_num=5)
 
-    # This only covers the released decoder's runtime shape requirement. Real
-    # FL2VA gold parity shows that repeating the last latent is not a
-    # semantically correct reconstruction of a five-frame prefix.
-    assert adapter.vae.decoded_latent_shape == (1, 24, 7, 2, 2)
-    assert decoded.shape == (1, 3, 5, 2, 2)
+    assert adapter.vae.decoded_latent_shape is None
 
 
 @pytest.mark.parametrize("num_frames", [0, 4, 6, 21, 23])

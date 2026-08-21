@@ -1,0 +1,45 @@
+{
+  "action_config": {
+    "action_dim": 7,
+    "attention_head_dim": 128,
+    "ffn_hidden_size": 4096,
+    "hidden_size": 1024,
+    "norm_eps": 1e-05,
+    "num_attention_heads": 56,
+    "num_layers": 50,
+    "qk_norm_eps": 1e-05,
+    "rope_inv_freq_len": 16,
+    "state_dim": 8,
+    "time_embed_dim": 1024,
+    "time_embed_hidden_size": 1024,
+    "timestep_input_dim": 256,
+    "use_gradient_checkpointing": false
+  },
+  "artifact": {
+    "filename": "H3ActionDiT_video_interp_1024hdim.pt",
+    "sha256": "6b0a3de516f67bc2d1c1e92712ead856c68b4cdaa067f78667dbacbc357230e6",
+    "size_bytes": 4827088347
+  },
+  "generation": {
+    "apply_alpha_scaling": true,
+    "command": [
+      "scripts/preprocess_h3_action_dit_backbone.py",
+      "--model-config",
+      "configs/model/fastwam_h3.yaml",
+      "--h3-transformer-dir",
+      "/root/wuqingman/models/MiniMax-H3/FL2VA/transformer",
+      "--output",
+      "checkpoints/H3ActionDiT_video_interp_1024hdim.pt",
+      "--dtype",
+      "bfloat16"
+    ],
+    "copied_tensors": 101,
+    "dtype": "bfloat16",
+    "interpolated_tensors": 404
+  },
+  "schema_version": 1,
+  "source_h3": {
+    "config_index_sha256": "233a1fda88b610501f8ba0c2b1d79e5dde88898ea627d8c840b1c891cecf101c",
+    "transformer_dir": "/root/wuqingman/models/MiniMax-H3/FL2VA/transformer"
+  }
+}

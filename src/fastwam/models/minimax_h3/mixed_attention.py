@@ -70,6 +70,7 @@ def asymmetric_joint_attention(
     action_k: torch.Tensor,
     action_v: torch.Tensor,
     masks: AsymmetricAttentionMasks,
+    detach_h3_for_action: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the exact version-one visibility matrix.
 
@@ -90,8 +91,10 @@ def asymmetric_joint_attention(
     h3_out = _attention(h3_q, h3_k, h3_v, h3_valid)
     h3_out = h3_out * h3_valid[:, :, None, None]
 
-    all_k = torch.cat((h3_k, action_k), dim=1)
-    all_v = torch.cat((h3_v, action_v), dim=1)
+    action_h3_k = h3_k.detach() if detach_h3_for_action else h3_k
+    action_h3_v = h3_v.detach() if detach_h3_for_action else h3_v
+    all_k = torch.cat((action_h3_k, action_k), dim=1)
+    all_v = torch.cat((action_h3_v, action_v), dim=1)
 
     state_key_valid = torch.zeros_like(action_valid)
     state_key_valid[:, 0] = True
@@ -127,6 +130,7 @@ def run_asymmetric_joint_block(
     action_rope_freqs: torch.Tensor,
     action_target_mask: torch.Tensor,
     masks: AsymmetricAttentionMasks,
+    detach_h3_for_action: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one aligned H3/Action block with asymmetric visibility."""
 
@@ -150,6 +154,7 @@ def run_asymmetric_joint_block(
         action_k=action_k,
         action_v=action_v,
         masks=masks,
+        detach_h3_for_action=detach_h3_for_action,
     )
     h3_hidden = h3_block.post_attention(
         h3_hidden, h3_attended, h3_modulation

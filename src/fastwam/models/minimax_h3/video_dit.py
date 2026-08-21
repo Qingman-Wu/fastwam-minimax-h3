@@ -160,6 +160,9 @@ class H3LoRABranch(nn.Module):
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.dropout_probability = float(dropout)
         self.scaling = float(alpha) / int(rank)
         self.dropout = nn.Dropout(float(dropout))
         self.lora_a = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
@@ -509,11 +512,18 @@ class MiniMaxH3VideoBackbone(nn.Module):
             )
 
     def lora_branches(self) -> list[H3LoRABranch]:
-        return [
-            module.lora
-            for module in self.modules()
-            if isinstance(module, H3LoRALinear)
-        ]
+        return list(self.named_lora_branches().values())
+
+    def named_lora_branches(self) -> dict[str, H3LoRABranch]:
+        branches: dict[str, H3LoRABranch] = {}
+        for block_index, block in enumerate(self.blocks):
+            for projection_name in ("qkv_proj", "out_proj"):
+                projection = getattr(block.attn, projection_name)
+                if isinstance(projection, H3LoRALinear):
+                    branches[
+                        f"blocks.{block_index}.attn.{projection_name}"
+                    ] = projection.lora
+        return branches
 
     def refine_text_condition(
         self,
@@ -574,6 +584,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
         action_fps: float,
         video_timestep_scale: float = 1000.0,
         action_timestep_scale: float = 1000.0,
+        detach_h3_for_action: bool = False,
         return_debug: bool = False,
     ) -> dict[str, Any]:
         """Run all aligned H3/Action layers for Scheme A."""
@@ -781,6 +792,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
                     action_rope_freqs=action_state.rope_freqs,
                     action_target_mask=action_state.action_mask,
                     masks=masks,
+                    detach_h3_for_action=detach_h3_for_action,
                 )
 
             if (

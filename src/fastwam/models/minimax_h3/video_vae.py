@@ -185,24 +185,12 @@ class MiniMaxH3VAEAdapter(nn.Module):
         target_device = next(self.vae.parameters()).device
         model_dtype = next(self.vae.parameters()).dtype
         raw = self._denormalize(latents.to(target_device)).to(model_dtype)
-        if frame_num is not None and int(frame_num) == 5:
-            # Prefix encoding keeps only two useful latents from a padded
-            # 17-frame chunk. The released decoder needs one complete
-            # tokens_chunk_size + token_overlap window before it can trim the
-            # causal reconstruction back to five frames.
-            minimum_tokens = int(self.vae.tokens_chunk_size) + int(
-                self.vae.token_overlap
+        if frame_num is not None and int(frame_num) == 5 and raw.shape[2] == 2:
+            raise NotImplementedError(
+                "The released H3 VAE cannot faithfully decode a five-frame "
+                "rollout from its two retained prefix latents. Use the latent "
+                "rollout directly or request a natively decodable frame count."
             )
-            if raw.shape[2] < minimum_tokens:
-                raw = torch.cat(
-                    (
-                        raw,
-                        raw[:, :, -1:].expand(
-                            -1, -1, minimum_tokens - raw.shape[2], -1, -1
-                        ),
-                    ),
-                    dim=2,
-                )
         decoded = self.vae.decode_base(raw, frame_num=frame_num)
         pixels = self.vae.processor.revert_tensor(decoded)
         # FastWAM's decoder contract is [-1, 1].

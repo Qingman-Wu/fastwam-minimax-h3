@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,14 @@ from omegaconf import OmegaConf
 from safetensors import safe_open
 
 from fastwam.models.minimax_h3 import H3ActionDiT
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _parse_dtype(name: str) -> torch.dtype:
@@ -200,9 +210,35 @@ def main() -> None:
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output_path)
+    source_digest = hashlib.sha256()
+    source_digest.update(source_config_path.read_bytes())
+    source_digest.update(index_path.read_bytes())
+    manifest = {
+        "schema_version": 1,
+        "artifact": {
+            "filename": output_path.name,
+            "size_bytes": output_path.stat().st_size,
+            "sha256": _sha256_file(output_path),
+        },
+        "source_h3": {
+            "transformer_dir": str(transformer_dir),
+            "config_index_sha256": source_digest.hexdigest(),
+        },
+        "action_config": action_config,
+        "generation": {
+            "command": list(sys.argv),
+            "dtype": args.dtype,
+            "apply_alpha_scaling": bool(args.apply_alpha_scaling),
+            "copied_tensors": copied,
+            "interpolated_tensors": interpolated,
+        },
+    }
+    manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(
         f"[INFO] Saved {output_path}: parameters={parameter_count / 1e9:.3f}B, "
-        f"copied={copied}, interpolated={interpolated}, dtype={output_dtype}."
+        f"copied={copied}, interpolated={interpolated}, dtype={output_dtype}; "
+        f"manifest={manifest_path}."
     )
 
 

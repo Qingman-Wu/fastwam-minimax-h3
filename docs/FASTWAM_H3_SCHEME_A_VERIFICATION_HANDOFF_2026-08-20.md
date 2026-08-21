@@ -2,7 +2,8 @@
 
 日期：2026-08-20  
 用途：交给另一名 AI 或工程师进行独立代码审查  
-状态：修复与单卡真实 smoke 已完成；修改尚未 commit/push
+状态：第一轮修复已在 `f8d4dd0c012101deab2a77150b378f35c252fd4b`
+推送；第 22 节生产收口修改正在本地验证，尚未再次提交
 
 ## 1. 审查对象和工作区
 
@@ -1139,3 +1140,297 @@ loss；block 0 qkv 甚至相差约 2011 倍。两者 cosine 为小正值，当�
 
 当前证据支持保留 joint optimization 作为设计方向，但不支持未经监控地直接使用
 `1:1` 权重跑长训练。
+
+## 22. Production integration 收口（2026-08-20 晚）
+
+### 22.1 5-frame pixel decode 已从生产默认路径移除
+
+真实 gold parity 已证明 2 latent repeat 到 7 的策略错误，因此现在：
+
+```text
+infer(..., decode_video=False)
+```
+
+默认返回：
+
+```text
+video_latents
+action
+```
+
+5 帧 latent 仍完整联合去噪，Action 仍读取 H3 world representation，但不会再执行
+昂贵且语义错误的 pixel decoder。
+
+显式请求：
+
+```text
+num_frames=5
+decode_video=true
+```
+
+会在采样开始前抛出 `NotImplementedError`。22/39 等具备原生可解码窗口的输出仍可
+显式设置 `decode_video=true`。
+
+`infer_action()` 强制 `decode_video=false`；CLI 会保存：
+
+```text
+*.action.pt
+*.video_latents.pt
+```
+
+仅在输出确实包含 pixel video 时才保存 MP4。
+
+### 22.2 第一轮 baseline 默认 stop-gradient Action loss -> H3
+
+新增配置：
+
+```yaml
+stop_action_gradient_to_h3: true
+```
+
+实现只对 Action attention 使用的 H3 K/V 做 detach：
+
+```text
+forward:
+  H3 -> Action 保持不变
+
+backward:
+  L_video  -> H3 LoRA
+  L_action -> Action Expert
+  L_action -/-> H3 LoRA
+```
+
+真实 33B、真实 LIBERO 样本验证：
+
+```text
+Action-only loss:
+  H3 LoRA grad tensors = 200
+  H3 non-zero grads     = 0
+  Action grad tensors   = 514
+  Action non-zero grads = 514
+
+Video-only loss:
+  H3 LoRA grad tensors = 200
+  H3 non-zero grads     = 100
+  Action grad tensors   = 514
+  Action non-zero grads = 0
+
+all gradients finite = true
+```
+
+零梯度 tensor 来自 joint checkpoint graph，不代表参数被更新。optimizer step 下只有
+non-zero 路径产生更新。
+
+### 22.3 Checkpoint schema 3
+
+weights checkpoint 现在严格保存：
+
+```text
+schema_version = 3
+Action Expert config + named state_dict
+H3 LoRA rank/alpha/dropout
+H3 LoRA full target module names
+base H3 config/index fingerprint
+named LoRA state_dict
+```
+
+LoRA key示例：
+
+```text
+blocks.0.attn.qkv_proj
+blocks.0.attn.out_proj
+...
+blocks.49.attn.out_proj
+```
+
+load 会严格比较：
+
+- schema version
+- Action Expert config
+- rank/alpha/dropout
+- base H3 fingerprint
+- 完整 module name 集合
+- tensor shape/state
+
+schema 2 会明确拒绝，不再静默恢复 zero-init LoRA。
+
+### 22.4 ActionDiT artifact contract
+
+初始化脚本现在自动生成相邻 manifest：
+
+```text
+H3ActionDiT_video_interp_1024hdim.pt.manifest.json
+```
+
+记录：
+
+- filename
+- exact byte size
+- artifact SHA256
+- source H3 config/index SHA256
+- Action Expert config
+- 完整生成命令
+- dtype
+- interpolation/scaling 策略
+- copied/interpolated tensor 数量
+
+加载 ActionDiT 前会强制检查 manifest、size 和 SHA256。缺失或 checksum 不一致会拒绝
+启动。
+
+当前 artifact：
+
+```text
+size   = 4,827,088,347 bytes
+SHA256 = 6b0a3de516f67bc2d1c1e92712ead856c68b4cdaa067f78667dbacbc357230e6
+```
+
+### 22.5 Qwen cache schema 3
+
+cache directory 现在必须包含 manifest，并记录：
+
+- encoder implementation signature
+- Qwen checkpoint config/index fingerprint
+- processor/tokenizer fingerprint
+- hidden layer
+- schema version
+
+每个 sample digest 和 payload 都绑定这两个 artifact fingerprint。相同代码但不同 Qwen
+权重、processor 或 tokenizer 不再能误读旧 cache。
+
+已用真实 Qwen-32B 和真实 LIBERO 样本成功生成一个 schema-3 cache sample。完整 cache
+正在重新生成。
+
+### 22.6 Action MM-RoPE 时间 contract
+
+effective Action RoPE fps 现在由实际 shape 计算：
+
+```text
+video_fps * action_horizon / (num_frames - 1)
+```
+
+如果 task 仍显式配置 `action_fps`，它只作为 assertion；与实际 frame/action layout
+不一致会立即报错。基础 model config 使用 `null`，避免隐藏一个错误的通用默认值；
+当前 LIBERO task 的 5-frame/32-action override 仍严格检查为 192 Hz。
+
+### 22.7 自动测试
+
+本轮修改后的 H3 测试：
+
+```text
+85 passed, 1 warning
+```
+
+warning 仍只是环境中的 `pynvml` deprecation。
+
+### 22.8 真实 8×H20 训练与恢复验证
+
+正式 ZeRO-2 smoke 已完成：
+
+```text
+GPU                = 8x H20 96 GiB
+micro batch        = 1 / GPU
+gradient accumulation = 16
+global batch       = 128
+optimizer step     = success
+weights checkpoint = 4.7 GiB
+full state          = 166 GiB
+```
+
+每卡初始化观测：
+
+```text
+allocated = 72.4 GiB
+reserved  = 74.94 GiB
+```
+
+随后在全新 8-rank 进程中加载：
+
+- model weights
+- ZeRO-2 optimizer shards
+- scheduler
+- random states
+- `global_step=1`
+- `epoch=0`
+- `batch_in_epoch=16`
+- dataloader sample offset 128
+
+并成功完成 `step=2`。因此“save → 新进程 load → resume one optimizer step”链路已
+通过真实权重与真实数据验证。
+
+### 22.9 Cache 可复现性修复
+
+多卡 smoke 首次暴露了 cache 与 padded-sample retry 的隐含随机性：
+
+```text
+相同 dataset index
+-> 随机选择不同 unpadded replacement
+-> f0 digest 改变
+-> offline cache miss
+```
+
+现在每个初始 index 使用由该 index 固定 seed 的 retry RNG；precompute 和 train 对同一
+index 必然选择同一 replacement。`FileNotFoundError` 也不再被 `__getitem__` 吞掉并
+随机换样本，避免用随机替代掩盖不完整 cache。
+
+precompute 新增：
+
+- 多样本 batch 编码
+- 指定 sampler seed 的 deterministic smoke subset
+- batch 内 cache path 去重
+
+真实完整 dataset 长度是 `277,713` 个窗口，不是 normalization 日志里的 1,712 个
+episode。按真实速度估计，全量 cache 约需 19 小时，预计占用约 0.9 TiB。
+
+### 22.10 最快稳定 setting
+
+8×H20 sustained benchmark：
+
+```text
+B=1, no gradient checkpoint:
+  1.67 samples/s
+
+B=1, gradient checkpoint:
+  1.51 samples/s
+
+B=2, no gradient checkpoint:
+  1.58 samples/s
+  GPU memory = 95.4--96.2 GiB / 97.9 GiB
+```
+
+结论：
+
+```text
+batch_size = 1
+mot_checkpoint_mixed_attn = false
+gradient_accumulation_steps = 16
+```
+
+是当前最快且有合理显存余量的正式训练 setting。B=2 不仅吞吐更低，而且只剩约
+1.7--2.4 GiB 显存余量，不适合作为长训练配置。
+
+### 22.11 Checkpoint 磁盘保留策略
+
+完整 ZeRO-2 state 每次约 166 GiB。新增：
+
+```yaml
+max_checkpoints: 2
+```
+
+每次 checkpoint 完成后只保留最新两个 full states 和最新两个 named schema-3 weights，
+防止 100k-step 实验因 checkpoint 累积耗尽磁盘。
+
+### 22.12 正式实验状态
+
+正式流水线已启动：
+
+```text
+full schema-3 Qwen cache
+  -> cache complete sentinel
+  -> 8xH20 large Scheme-A training
+```
+
+大训练 run id：
+
+```text
+scheme-a-large-stopgrad-nogc-20260821
+```

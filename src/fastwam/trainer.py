@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -42,6 +43,9 @@ class Wan22Trainer:
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
         self.save_final_checkpoint = bool(cfg.get("save_final_checkpoint", True))
+        self.max_checkpoints = int(cfg.get("max_checkpoints", 0))
+        if self.max_checkpoints < 0:
+            raise ValueError("max_checkpoints must be non-negative")
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -670,6 +674,18 @@ class Wan22Trainer:
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
+    def _prune_checkpoints(self):
+        if self.max_checkpoints <= 0:
+            return
+        state_paths = sorted(Path(self.state_dir).glob("step_*"))
+        weight_paths = sorted(Path(self.weights_dir).glob("step_*.pt"))
+        for path in state_paths[: -self.max_checkpoints]:
+            shutil.rmtree(path)
+            logger.info("Pruned old training state: %s", path)
+        for path in weight_paths[: -self.max_checkpoints]:
+            path.unlink()
+            logger.info("Pruned old weights checkpoint: %s", path)
+
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
 
@@ -684,6 +700,9 @@ class Wan22Trainer:
         self.accelerator.save_state(output_dir=state_path)
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self._prune_checkpoints()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
@@ -700,12 +719,25 @@ class Wan22Trainer:
                 self.epoch = int(payload["epoch"])
                 self.batch_in_epoch = int(payload["batch_in_epoch"])
                 self.train_sampler.set_epoch_offset(self.epoch)
-                self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
+                sampler_state = Path(state_dir) / "sampler.bin"
+                if sampler_state.is_file():
+                    # Accelerate restores the prepared dataloader cursor from
+                    # sampler.bin. Applying our sample offset as well would
+                    # skip the consumed global batch range a second time.
+                    self.train_sampler.clear_resume_batch_offset()
+                    resume_source = "accelerate sampler state"
+                else:
+                    self.train_sampler.set_resume_batch_offset(
+                        self.batch_in_epoch
+                    )
+                    resume_source = "trainer sample offset"
                 logger.info(
-                    "Restored dataloader progress: epoch=%d batch_in_epoch=%d sample_offset=%d",
+                    "Restored dataloader progress: epoch=%d batch_in_epoch=%d "
+                    "sample_offset=%d source=%s",
                     self.epoch,
                     self.batch_in_epoch,
                     self.batch_in_epoch * self.batch_size * self.accelerator.num_processes,
+                    resume_source,
                 )
             else:
                 self.epoch = 0

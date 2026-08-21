@@ -109,7 +109,7 @@ def make_model(*, text_conditioner=None):
         loss_lambda_video=1.0,
         loss_lambda_action=1.0,
         video_fps=24.0,
-        action_fps=8.0,
+        action_fps=None,
         freeze_video_expert=True,
     )
 
@@ -143,6 +143,7 @@ def test_joint_inference_updates_full_video_and_action_at_every_step():
     assert not torch.equal(
         model.video_expert.calls[0]["action"], model.video_expert.calls[1]["action"]
     )
+    assert output["video_latents"].shape == (2, 2, 2, 2)
     assert output["action"].shape == (4, 3)
     assert not torch.equal(output["action"], torch.zeros_like(output["action"]))
 
@@ -152,7 +153,7 @@ def test_inference_conditions_are_computed_once_and_never_replace_video_noise():
 
     model.infer(**infer_kwargs())
 
-    assert [call[0] for call in model.vae.calls] == ["encode", "decode"]
+    assert [call[0] for call in model.vae.calls] == ["encode"]
     assert model.vae.calls[0][1] is True
     assert torch.equal(
         model.video_expert.calls[0]["video"], torch.zeros(1, 2, 2, 2, 2)
@@ -191,14 +192,34 @@ def test_video_and_action_keep_separate_shifted_schedules():
     assert second["video_timestep"].item() != second["action_timestep"].item()
 
 
-def test_decoded_auxiliary_video_is_generated_not_repeated_input_frame():
+def test_five_frame_pixel_decode_is_rejected_before_sampling():
     model = make_model()
+    kwargs = infer_kwargs()
+    kwargs["decode_video"] = True
 
-    output = model.infer(**infer_kwargs())
+    with pytest.raises(NotImplementedError, match="cannot faithfully decode"):
+        model.infer(**kwargs)
 
-    assert len(output["video"]) == 5
-    assert output["video"][0].tobytes() != output["video"][1].tobytes()
-    assert model.vae.calls[-1][1] == 5
+    assert not model.video_expert.calls
+    assert not model.vae.calls
+
+
+def test_native_long_window_can_request_auxiliary_pixel_decode():
+    model = make_model()
+    kwargs = infer_kwargs()
+    kwargs.update(
+        {
+            "num_frames": 22,
+            "video_noise": torch.zeros(1, 2, 7, 2, 2),
+            "decode_video": True,
+        }
+    )
+
+    output = model.infer(**kwargs)
+
+    assert set(output) == {"video_latents", "video", "action"}
+    assert len(output["video"]) == 22
+    assert model.vae.calls[-1][1] == 22
 
 
 def test_inference_rejects_ground_truth_action_conditioning():
@@ -219,6 +240,14 @@ def test_inference_requires_two_or_more_h3_sigma_points():
         model.infer(**kwargs)
 
 
+def test_configured_action_rope_clock_must_match_frame_action_layout():
+    model = make_model()
+    model.action_fps = 8.0
+
+    with pytest.raises(ValueError, match="equivalent RoPE clock"):
+        model.infer(**infer_kwargs())
+
+
 def test_evaluator_compatibility_wrappers_reuse_joint_sampler():
     model = make_model()
     kwargs = infer_kwargs()
@@ -227,6 +256,6 @@ def test_evaluator_compatibility_wrappers_reuse_joint_sampler():
     joint = model.infer_joint(prompt=None, **kwargs)
     action = model.infer_action(prompt=None, **kwargs)
 
-    assert set(joint) == {"video", "action"}
+    assert set(joint) == {"video_latents", "action"}
     assert set(action) == {"action"}
     assert torch.equal(action["action"], joint["action"])

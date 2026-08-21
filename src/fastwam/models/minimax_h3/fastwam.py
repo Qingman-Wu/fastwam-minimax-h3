@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -18,6 +20,22 @@ from .action_dit import H3ActionDiT
 from .text_encoder import H3TextConditionBatch, MiniMaxH3TextConditioner
 from .video_dit import MiniMaxH3VideoBackbone, load_h3_video_backbone
 from .video_vae import MiniMaxH3VAEAdapter, augment_keyframe_latents
+
+
+def _h3_checkpoint_fingerprint(model_path: str | Path) -> str:
+    """Fingerprint the immutable H3 config/index manifest without hashing shards."""
+
+    transformer_path = Path(model_path) / "transformer"
+    manifests = sorted(transformer_path.glob("*.json"))
+    if not manifests:
+        return "unavailable"
+    digest = hashlib.sha256()
+    for manifest in manifests:
+        digest.update(manifest.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(manifest.read_bytes())
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
 
 
 class FastWAMH3(nn.Module):
@@ -44,9 +62,13 @@ class FastWAMH3(nn.Module):
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
         video_fps: float = 24.0,
-        action_fps: float = 8.0,
+        action_fps: float | None = None,
         freeze_video_expert: bool = True,
         h3_lora_rank: int = 0,
+        h3_lora_alpha: float = 32.0,
+        h3_lora_dropout: float = 0.0,
+        stop_action_gradient_to_h3: bool = True,
+        base_h3_fingerprint: str = "unavailable",
     ) -> None:
         super().__init__()
         if action_expert.num_layers != video_expert.num_layers:
@@ -57,8 +79,10 @@ class FastWAMH3(nn.Module):
             raise ValueError("H3 action and video experts must have the same head dimension")
         if not 0.0 <= float(keyframe_condition_strength) <= 1.0:
             raise ValueError("keyframe_condition_strength must be in [0, 1]")
-        if float(video_fps) <= 0 or float(action_fps) <= 0:
-            raise ValueError("video_fps and action_fps must be positive")
+        if float(video_fps) <= 0:
+            raise ValueError("video_fps must be positive")
+        if action_fps is not None and float(action_fps) <= 0:
+            raise ValueError("action_fps must be positive when configured")
 
         self.video_expert = video_expert
         self.action_expert = action_expert
@@ -71,9 +95,13 @@ class FastWAMH3(nn.Module):
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
         self.video_fps = float(video_fps)
-        self.action_fps = float(action_fps)
+        self.action_fps = None if action_fps is None else float(action_fps)
         self.freeze_video_expert = bool(freeze_video_expert)
         self.h3_lora_rank = int(h3_lora_rank)
+        self.h3_lora_alpha = float(h3_lora_alpha)
+        self.h3_lora_dropout = float(h3_lora_dropout)
+        self.stop_action_gradient_to_h3 = bool(stop_action_gradient_to_h3)
+        self.base_h3_fingerprint = str(base_h3_fingerprint)
 
         self.train_video_scheduler = WanContinuousFlowMatchScheduler(
             num_train_timesteps=video_num_train_timesteps,
@@ -125,11 +153,12 @@ class FastWAMH3(nn.Module):
         loss_lambda_video: float,
         loss_lambda_action: float,
         video_fps: float,
-        action_fps: float,
+        action_fps: float | None,
         freeze_video_expert: bool,
         h3_lora_rank: int = 0,
         h3_lora_alpha: float = 32.0,
         h3_lora_dropout: float = 0.0,
+        stop_action_gradient_to_h3: bool = True,
     ) -> "FastWAMH3":
         model_path = Path(model_path)
         video_expert = load_h3_video_backbone(
@@ -182,11 +211,43 @@ class FastWAMH3(nn.Module):
             action_fps=action_fps,
             freeze_video_expert=freeze_video_expert,
             h3_lora_rank=h3_lora_rank,
+            h3_lora_alpha=h3_lora_alpha,
+            h3_lora_dropout=h3_lora_dropout,
+            stop_action_gradient_to_h3=stop_action_gradient_to_h3,
+            base_h3_fingerprint=_h3_checkpoint_fingerprint(model_path),
         )
 
+    def _named_h3_lora_branches(self) -> dict[str, nn.Module]:
+        getter = getattr(self.video_expert, "named_lora_branches", None)
+        if getter is None:
+            return {}
+        return dict(getter())
+
     def _h3_lora_branches(self) -> list[nn.Module]:
+        named = self._named_h3_lora_branches()
+        if named:
+            return list(named.values())
         getter = getattr(self.video_expert, "lora_branches", None)
         return [] if getter is None else list(getter())
+
+    def _effective_action_rope_fps(
+        self, *, num_frames: int, action_horizon: int
+    ) -> float:
+        if int(num_frames) <= 1 or int(action_horizon) <= 0:
+            raise ValueError("Action RoPE timing requires frames>1 and actions>0")
+        effective = (
+            self.video_fps * float(action_horizon) / float(num_frames - 1)
+        )
+        if self.action_fps is not None and not math.isclose(
+            self.action_fps, effective, rel_tol=1e-6, abs_tol=1e-6
+        ):
+            raise ValueError(
+                "Configured action_fps does not match the Scheme-A equivalent "
+                "RoPE clock: "
+                f"{self.action_fps} != {effective} "
+                f"for {action_horizon} actions across {num_frames} frames"
+            )
+        return effective
 
     def trainable_modules(self) -> list[nn.Module]:
         modules: list[nn.Module] = [self.action_expert]
@@ -500,13 +561,16 @@ class FastWAMH3(nn.Module):
             action_valid=action_valid,
             keyframe_condition_strength=self.keyframe_condition_strength,
             video_fps=self.video_fps,
-            action_fps=self.action_fps,
+            action_fps=self._effective_action_rope_fps(
+                num_frames=video.shape[2], action_horizon=action.shape[1]
+            ),
             video_timestep_scale=float(
                 self.train_video_scheduler.num_train_timesteps
             ),
             action_timestep_scale=float(
                 self.train_action_scheduler.num_train_timesteps
             ),
+            detach_h3_for_action=self.stop_action_gradient_to_h3,
         )
         video_prediction = predictions["video_prediction"]
         action_prediction = predictions["action_prediction"]
@@ -605,10 +669,16 @@ class FastWAMH3(nn.Module):
         video_noise: torch.Tensor | None = None,
         action_noise: torch.Tensor | None = None,
         keyframe_noise: torch.Tensor | None = None,
+        decode_video: bool = False,
     ) -> dict[str, Any]:
-        """Jointly sample a complete H3 video target and an action trajectory."""
+        """Jointly sample video latents and actions, with optional pixel decode."""
 
         del negative_prompt, text_cfg_scale, action_cfg_scale, tiled
+        if decode_video and int(num_frames) == 5:
+            raise NotImplementedError(
+                "Five-frame H3 latent rollout is supported, but the released "
+                "VAE cannot faithfully decode its two retained prefix latents."
+            )
         if action is not None:
             raise ValueError(
                 "FastWAM-H3 inference does not accept ground-truth action conditioning"
@@ -771,13 +841,16 @@ class FastWAMH3(nn.Module):
                 action_valid=action_valid,
                 keyframe_condition_strength=self.keyframe_condition_strength,
                 video_fps=self.video_fps,
-                action_fps=self.action_fps,
+                action_fps=self._effective_action_rope_fps(
+                    num_frames=num_frames, action_horizon=action_horizon
+                ),
                 video_timestep_scale=float(
                     self.infer_video_scheduler.num_train_timesteps
                 ),
                 action_timestep_scale=float(
                     self.infer_action_scheduler.num_train_timesteps
                 ),
+                detach_h3_for_action=self.stop_action_gradient_to_h3,
             )
             latents_video = self.infer_video_scheduler.step(
                 predictions["video_prediction"], video_delta, latents_video
@@ -786,10 +859,15 @@ class FastWAMH3(nn.Module):
                 predictions["action_prediction"], action_delta, latents_action
             )
 
-        return {
-            "video": self._decode_latents(latents_video, frame_num=num_frames),
+        output: dict[str, Any] = {
+            "video_latents": latents_video[0].detach().float().cpu(),
             "action": latents_action[0].detach().float().cpu(),
         }
+        if decode_video:
+            output["video"] = self._decode_latents(
+                latents_video, frame_num=num_frames
+            )
+        return output
 
     @torch.no_grad()
     def infer_joint(
@@ -802,6 +880,7 @@ class FastWAMH3(nn.Module):
         proprio: torch.Tensor | None = None,
         context: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
+        decode_video: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Compatibility wrapper; `infer` remains the only joint sampler."""
@@ -818,6 +897,7 @@ class FastWAMH3(nn.Module):
             proprio=proprio,
             context=context,
             context_mask=context_mask,
+            decode_video=decode_video,
             **kwargs,
         )
 
@@ -835,6 +915,7 @@ class FastWAMH3(nn.Module):
     ) -> dict[str, Any]:
         """Evaluator-compatible action result backed by joint denoising."""
 
+        kwargs.pop("decode_video", None)
         output = self.infer_joint(
             prompt=prompt,
             input_image=input_image,
@@ -843,21 +924,48 @@ class FastWAMH3(nn.Module):
             proprio=proprio,
             context=context,
             context_mask=context_mask,
+            decode_video=False,
             **kwargs,
         )
         return {"action": output["action"]}
 
+    def _action_expert_checkpoint_config(self) -> dict[str, int]:
+        return {
+            "action_dim": int(self.action_expert.action_dim),
+            "state_dim": int(self.action_expert.state_dim),
+            "hidden_size": int(self.action_expert.hidden_size),
+            "num_layers": int(self.action_expert.num_layers),
+            "num_heads": int(self.action_expert.num_heads),
+            "attention_head_dim": int(self.action_expert.attn_head_dim),
+        }
+
+    def _h3_lora_checkpoint_config(self) -> dict[str, Any]:
+        branches = self._named_h3_lora_branches()
+        return {
+            "rank": self.h3_lora_rank,
+            "alpha": self.h3_lora_alpha,
+            "dropout": self.h3_lora_dropout,
+            "targets": list(branches),
+            "base_h3_fingerprint": self.base_h3_fingerprint,
+        }
+
     def save_checkpoint(self, path: str | Path, optimizer=None, step=None):
+        branches = self._named_h3_lora_branches()
+        if self.h3_lora_rank > 0 and not branches:
+            raise RuntimeError("Configured H3 LoRA branches are missing")
         payload = {
-            "schema_version": 2,
-            "action_expert": self.action_expert.state_dict(),
+            "schema_version": 3,
+            "action_expert": {
+                "config": self._action_expert_checkpoint_config(),
+                "state_dict": self.action_expert.state_dict(),
+            },
             "step": step,
             "backbone": "MiniMax-H3-FL2VA-Scheme-A",
-            "h3_lora_rank": self.h3_lora_rank,
+            "h3_lora_config": self._h3_lora_checkpoint_config(),
+            "h3_lora": {
+                name: branch.state_dict() for name, branch in branches.items()
+            },
         }
-        branches = self._h3_lora_branches()
-        if branches:
-            payload["h3_lora"] = [branch.state_dict() for branch in branches]
         if not self.freeze_video_expert:
             payload["video_expert"] = self.video_expert.state_dict()
         if optimizer is not None:
@@ -866,15 +974,36 @@ class FastWAMH3(nn.Module):
 
     def load_checkpoint(self, path: str | Path, optimizer=None):
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("schema_version") != 2:
-            raise ValueError("Checkpoint is not a FastWAM-H3 Scheme A checkpoint")
-        self.action_expert.load_state_dict(payload["action_expert"], strict=True)
-        if "h3_lora" in payload:
-            branches = self._h3_lora_branches()
-            if len(branches) != len(payload["h3_lora"]):
-                raise ValueError("Checkpoint H3 LoRA branch count does not match model")
-            for branch, state in zip(branches, payload["h3_lora"]):
-                branch.load_state_dict(state, strict=True)
+        if payload.get("schema_version") != 3:
+            raise ValueError(
+                "Checkpoint is not a FastWAM-H3 Scheme A schema-3 checkpoint"
+            )
+        action_payload = payload.get("action_expert")
+        if not isinstance(action_payload, dict):
+            raise ValueError("Checkpoint is missing the Action Expert payload")
+        expected_action_config = self._action_expert_checkpoint_config()
+        if action_payload.get("config") != expected_action_config:
+            raise ValueError(
+                "Checkpoint Action Expert config does not match the model: "
+                f"{action_payload.get('config')} != {expected_action_config}"
+            )
+        expected_lora_config = self._h3_lora_checkpoint_config()
+        if payload.get("h3_lora_config") != expected_lora_config:
+            raise ValueError(
+                "Checkpoint H3 LoRA config does not match the model: "
+                f"{payload.get('h3_lora_config')} != {expected_lora_config}"
+            )
+        branches = self._named_h3_lora_branches()
+        lora_payload = payload.get("h3_lora")
+        if not isinstance(lora_payload, dict) or set(lora_payload) != set(branches):
+            raise ValueError(
+                "Checkpoint H3 LoRA module names do not match the model"
+            )
+        self.action_expert.load_state_dict(
+            action_payload["state_dict"], strict=True
+        )
+        for name, branch in branches.items():
+            branch.load_state_dict(lora_payload[name], strict=True)
         if "video_expert" in payload:
             self.video_expert.load_state_dict(payload["video_expert"], strict=True)
         if optimizer is not None and "optimizer" in payload:

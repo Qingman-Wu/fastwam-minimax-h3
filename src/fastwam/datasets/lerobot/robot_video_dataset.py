@@ -130,12 +130,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
     def _get(self, idx):
         if self.skip_padding_as_possible:
+            retry_rng = np.random.default_rng(int(idx))
             sample = fetch_unpadded_temporal_sample(
                 self.lerobot_dataset.__getitem__,
                 initial_index=idx,
                 dataset_size=len(self.lerobot_dataset),
                 max_retries=self.max_padding_retry,
-                random_index=np.random.randint,
+                random_index=lambda size: int(retry_rng.integers(size)),
             )
         else:
             sample = self.lerobot_dataset[idx]
@@ -285,11 +286,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         try:
             data = self._get(idx)
+        except FileNotFoundError:
+            # A cache miss is a deterministic artifact error, not a corrupt
+            # sample. Random substitution only hides incomplete cache jobs.
+            raise
         except Exception as e:
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
             print(traceback.format_exc())
-            random_idx = np.random.randint(len(self))
+            random_idx = int(np.random.default_rng(int(idx)).integers(len(self)))
             data = self._get(random_idx)
         return data
 

@@ -71,7 +71,7 @@ def make_model(first_latent_value=1.0):
         loss_lambda_video=1.0,
         loss_lambda_action=1.0,
         video_fps=24.0,
-        action_fps=8.0,
+        action_fps=None,
         freeze_video_expert=True,
     )
 

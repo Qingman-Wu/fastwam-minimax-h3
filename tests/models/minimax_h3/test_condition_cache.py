@@ -3,13 +3,23 @@ import torch
 from fastwam.datasets.h3_condition_cache import (
     collate_h3_condition_samples,
     h3_condition_cache_path,
+    initialize_h3_condition_cache,
     load_h3_condition_cache,
     save_h3_condition_cache,
 )
 
 
+def initialize(cache_dir, *, qwen="sha256:qwen-a", processor="sha256:processor-a"):
+    initialize_h3_condition_cache(
+        cache_dir,
+        qwen_checkpoint_fingerprint=qwen,
+        processor_fingerprint=processor,
+    )
+
+
 def test_h3_condition_cache_is_keyed_by_first_frame_and_instruction(tmp_path):
     frame = torch.zeros(3, 4, 4)
+    initialize(tmp_path)
 
     first = h3_condition_cache_path(tmp_path, frame, "pick up cup")
     changed_text = h3_condition_cache_path(tmp_path, frame, "open drawer")
@@ -19,13 +29,14 @@ def test_h3_condition_cache_is_keyed_by_first_frame_and_instruction(tmp_path):
 
     assert first != changed_text
     assert first != changed_frame
-    assert first.name.endswith(".h3-qwen-prenorm-layer50-v2.pt")
+    assert first.name.endswith(".h3-qwen-prenorm-layer50-v3.pt")
 
 
 def test_h3_condition_cache_round_trip_preserves_native_rows(tmp_path):
     frame = torch.zeros(3, 4, 4)
     embeddings = torch.randn(3, 5120, dtype=torch.bfloat16)
     tags = torch.tensor([1, 0, 1])
+    initialize(tmp_path)
 
     save_h3_condition_cache(
         tmp_path,
@@ -41,6 +52,21 @@ def test_h3_condition_cache_round_trip_preserves_native_rows(tmp_path):
     assert torch.equal(loaded["prompt_embeds"], embeddings)
     assert torch.equal(loaded["prompt_token_tags"], tags)
     assert loaded["prompt_attention_mask"].tolist() == [True, True, True]
+
+
+def test_h3_condition_cache_manifest_rejects_different_qwen_weights(tmp_path):
+    initialize(tmp_path)
+
+    try:
+        initialize_h3_condition_cache(
+            tmp_path,
+            qwen_checkpoint_fingerprint="sha256:qwen-b",
+            processor_fingerprint="sha256:processor-a",
+        )
+    except ValueError as error:
+        assert "manifest" in str(error)
+    else:
+        raise AssertionError("Different Qwen weights must invalidate the cache")
 
 
 def test_h3_condition_collate_pads_variable_qwen_lengths_without_valid_padding():

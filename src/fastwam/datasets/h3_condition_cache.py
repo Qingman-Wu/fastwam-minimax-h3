@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import uuid
 from pathlib import Path
@@ -17,7 +18,8 @@ from fastwam.models.minimax_h3.text_encoder import H3_QWEN_ENCODER_SIGNATURE
 
 H3_QWEN_WIDTH = 5120
 H3_QWEN_LAYER = 50
-H3_CACHE_SCHEMA_VERSION = 2
+H3_CACHE_SCHEMA_VERSION = 3
+H3_CACHE_MANIFEST = "h3-qwen-cache-manifest.json"
 H3_CACHE_KEYS = (
     "prompt_embeds",
     "prompt_token_tags",
@@ -25,7 +27,62 @@ H3_CACHE_KEYS = (
 )
 
 
-def _cache_digest(first_frame: torch.Tensor, instruction: str) -> str:
+def initialize_h3_condition_cache(
+    cache_dir: str | Path,
+    *,
+    qwen_checkpoint_fingerprint: str,
+    processor_fingerprint: str,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    cache_dir = Path(cache_dir).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_dir / H3_CACHE_MANIFEST
+    manifest = {
+        "schema_version": H3_CACHE_SCHEMA_VERSION,
+        "hidden_layer": H3_QWEN_LAYER,
+        "encoder_signature": H3_QWEN_ENCODER_SIGNATURE,
+        "qwen_checkpoint_fingerprint": str(qwen_checkpoint_fingerprint),
+        "processor_fingerprint": str(processor_fingerprint),
+    }
+    if manifest_path.is_file():
+        current = json.loads(manifest_path.read_text())
+        if current == manifest:
+            return manifest
+        if not overwrite:
+            raise ValueError(
+                "H3 condition cache manifest does not match the requested "
+                "Qwen/processor artifacts"
+            )
+    temporary = cache_dir / f".{H3_CACHE_MANIFEST}.tmp.{uuid.uuid4().hex}"
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, manifest_path)
+    return manifest
+
+
+def _load_cache_manifest(cache_dir: str | Path) -> dict[str, Any]:
+    manifest_path = Path(cache_dir).expanduser() / H3_CACHE_MANIFEST
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing H3 condition cache manifest: {manifest_path}. "
+            "Regenerate the cache with scripts/precompute_h3_conditions.py."
+        )
+    manifest = json.loads(manifest_path.read_text())
+    if (
+        manifest.get("schema_version") != H3_CACHE_SCHEMA_VERSION
+        or manifest.get("hidden_layer") != H3_QWEN_LAYER
+        or manifest.get("encoder_signature") != H3_QWEN_ENCODER_SIGNATURE
+        or not manifest.get("qwen_checkpoint_fingerprint")
+        or not manifest.get("processor_fingerprint")
+    ):
+        raise ValueError(f"Incompatible H3 condition cache manifest: {manifest_path}")
+    return manifest
+
+
+def _cache_digest(
+    first_frame: torch.Tensor,
+    instruction: str,
+    manifest: dict[str, Any],
+) -> str:
     if first_frame.ndim != 3 or first_frame.shape[0] != 3:
         raise ValueError(
             f"H3 cache first_frame must be [3,H,W], got {tuple(first_frame.shape)}"
@@ -43,6 +100,8 @@ def _cache_digest(first_frame: torch.Tensor, instruction: str) -> str:
         (
             f"h3-cache-v{H3_CACHE_SCHEMA_VERSION}\0"
             f"{H3_QWEN_ENCODER_SIGNATURE}\0"
+            f"{manifest['qwen_checkpoint_fingerprint']}\0"
+            f"{manifest['processor_fingerprint']}\0"
         ).encode()
     )
     digest.update(instruction.encode("utf-8"))
@@ -57,8 +116,9 @@ def h3_condition_cache_path(
     first_frame: torch.Tensor,
     instruction: str,
 ) -> Path:
-    digest = _cache_digest(first_frame, instruction)
-    return Path(cache_dir).expanduser() / f"{digest}.h3-qwen-prenorm-layer50-v2.pt"
+    manifest = _load_cache_manifest(cache_dir)
+    digest = _cache_digest(first_frame, instruction, manifest)
+    return Path(cache_dir).expanduser() / f"{digest}.h3-qwen-prenorm-layer50-v3.pt"
 
 
 def save_h3_condition_cache(
@@ -79,12 +139,15 @@ def save_h3_condition_cache(
     token_tags = token_tags.detach().cpu().to(torch.long)
     if not torch.logical_or(token_tags == 0, token_tags == 1).all():
         raise ValueError("H3 cached token_tags must contain only 0 or 1")
+    manifest = _load_cache_manifest(cache_dir)
     path = h3_condition_cache_path(cache_dir, first_frame, instruction)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": H3_CACHE_SCHEMA_VERSION,
         "hidden_layer": H3_QWEN_LAYER,
         "encoder_signature": H3_QWEN_ENCODER_SIGNATURE,
+        "qwen_checkpoint_fingerprint": manifest["qwen_checkpoint_fingerprint"],
+        "processor_fingerprint": manifest["processor_fingerprint"],
         "prompt_embeds": embeddings.detach().cpu(),
         "prompt_token_tags": token_tags,
     }
@@ -100,6 +163,7 @@ def load_h3_condition_cache(
     first_frame: torch.Tensor,
     instruction: str,
 ) -> dict[str, torch.Tensor]:
+    manifest = _load_cache_manifest(cache_dir)
     path = h3_condition_cache_path(cache_dir, first_frame, instruction)
     if not path.is_file():
         raise FileNotFoundError(
@@ -111,6 +175,10 @@ def load_h3_condition_cache(
         payload.get("schema_version") != H3_CACHE_SCHEMA_VERSION
         or payload.get("hidden_layer") != H3_QWEN_LAYER
         or payload.get("encoder_signature") != H3_QWEN_ENCODER_SIGNATURE
+        or payload.get("qwen_checkpoint_fingerprint")
+        != manifest["qwen_checkpoint_fingerprint"]
+        or payload.get("processor_fingerprint")
+        != manifest["processor_fingerprint"]
     ):
         raise ValueError(f"Incompatible H3 condition cache schema in {path}")
     embeddings = payload["prompt_embeds"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -20,6 +21,40 @@ H3_QWEN_ENCODER_SIGNATURE = (
 )
 H3_VIDEO_TAG = 0
 H3_TEXT_TAG = 1
+
+
+def h3_qwen_artifact_fingerprints(model_path: str | Path) -> dict[str, str]:
+    model_path = Path(model_path)
+
+    def fingerprint(relative_paths: tuple[str, ...]) -> str:
+        digest = hashlib.sha256()
+        for relative_path in relative_paths:
+            path = model_path / relative_path
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing H3 Qwen artifact file: {path}")
+            digest.update(relative_path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return f"sha256:{digest.hexdigest()}"
+
+    return {
+        "qwen_checkpoint_fingerprint": fingerprint(
+            (
+                "text_encoder/config.json",
+                "text_encoder/model.safetensors.index.json",
+            )
+        ),
+        "processor_fingerprint": fingerprint(
+            (
+                "processor/preprocessor_config.json",
+                "processor/video_preprocessor_config.json",
+                "processor/tokenizer_config.json",
+                "processor/tokenizer.json",
+                "processor/chat_template.json",
+            )
+        ),
+    }
 
 
 @dataclass(frozen=True)
