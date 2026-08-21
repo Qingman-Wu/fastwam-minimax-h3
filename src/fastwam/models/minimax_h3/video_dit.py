@@ -6,7 +6,7 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -196,6 +196,8 @@ class H3LoRALinear(nn.Module):
             device=base.weight.device,
             dtype=base.weight.dtype,
         )
+        self.capture_diagnostics = False
+        self.diagnostic_stats: dict[str, float] | None = None
 
     @property
     def weight(self) -> nn.Parameter:
@@ -206,7 +208,19 @@ class H3LoRALinear(nn.Module):
         return self.base.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.lora(x)
+        base_output = self.base(x)
+        lora_output = self.lora(x)
+        if self.capture_diagnostics:
+            base_rms = base_output.detach().float().square().mean().sqrt()
+            lora_rms = lora_output.detach().float().square().mean().sqrt()
+            self.diagnostic_stats = {
+                "base_output_rms": float(base_rms),
+                "lora_output_rms": float(lora_rms),
+                "lora_to_base_rms_ratio": float(
+                    lora_rms / base_rms.clamp(min=1e-12)
+                ),
+            }
+        return base_output + lora_output
 
 
 class H3MLP(nn.Module):
@@ -586,6 +600,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
         action_timestep_scale: float = 1000.0,
         detach_h3_for_action: bool = False,
         return_debug: bool = False,
+        debug_block_indices: Sequence[int] | None = None,
     ) -> dict[str, Any]:
         """Run all aligned H3/Action layers for Scheme A."""
 
@@ -772,8 +787,18 @@ class MiniMaxH3VideoBackbone(nn.Module):
             h3_condition=h3_condition,
             action_valid=action_stream_valid,
         )
+        debug_indices = set(int(index) for index in (debug_block_indices or ()))
+        invalid_debug_indices = debug_indices - set(range(len(self.blocks)))
+        if invalid_debug_indices:
+            raise ValueError(
+                f"Invalid H3 debug block indices: {sorted(invalid_debug_indices)}"
+            )
+        debug_h3_hidden: dict[int, torch.Tensor] = {}
+
         action_hidden = action_state.tokens
-        for h3_block, action_block in zip(self.blocks, action_expert.blocks):
+        for block_index, (h3_block, action_block) in enumerate(
+            zip(self.blocks, action_expert.blocks)
+        ):
             def layer_forward(
                 current_h3: torch.Tensor,
                 current_action: torch.Tensor,
@@ -810,6 +835,10 @@ class MiniMaxH3VideoBackbone(nn.Module):
                 h3_hidden, action_hidden = layer_forward(
                     h3_hidden, action_hidden
                 )
+            if return_debug and block_index in debug_indices:
+                debug_h3_hidden[block_index] = (
+                    h3_hidden.detach().float().cpu().clone()
+                )
 
         video_logits = self.final_layer(
             h3_hidden, h3_time_embedding, inverse_indices
@@ -829,6 +858,7 @@ class MiniMaxH3VideoBackbone(nn.Module):
                 "h3_condition": h3_condition,
                 "refiner_cu_seqlens": refiner_cu,
                 "action_progress": action_progress,
+                "h3_hidden_by_block": debug_h3_hidden,
             }
         return output
 

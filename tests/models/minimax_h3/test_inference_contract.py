@@ -148,6 +148,18 @@ def test_joint_inference_updates_full_video_and_action_at_every_step():
     assert not torch.equal(output["action"], torch.zeros_like(output["action"]))
 
 
+def test_inference_accepts_unbatched_cached_qwen_rows():
+    model = make_model()
+    kwargs = infer_kwargs()
+    kwargs["prompt_embeds"] = kwargs["prompt_embeds"][0]
+    kwargs["prompt_token_tags"] = kwargs["prompt_token_tags"][0]
+    kwargs["prompt_attention_mask"] = kwargs["prompt_attention_mask"][0]
+
+    output = model.infer(**kwargs)
+
+    assert output["video_latents"].shape == (2, 2, 2, 2)
+
+
 def test_inference_conditions_are_computed_once_and_never_replace_video_noise():
     model = make_model()
 

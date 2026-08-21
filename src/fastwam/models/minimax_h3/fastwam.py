@@ -353,6 +353,10 @@ class FastWAMH3(nn.Module):
                     "prompt_token_tags and prompt_attention_mask are required with "
                     "precomputed H3 Qwen embeddings"
                 )
+            if tags.ndim == 1:
+                tags = tags.unsqueeze(0)
+            if valid.ndim == 1:
+                valid = valid.unsqueeze(0)
             embeddings = embeddings.to(device=self.device, dtype=self.torch_dtype)
             tags = tags.to(device=self.device, dtype=torch.long)
             valid = valid.to(device=self.device, dtype=torch.bool)
@@ -430,6 +434,8 @@ class FastWAMH3(nn.Module):
         video_noise: torch.Tensor | None = None,
         action_noise: torch.Tensor | None = None,
         keyframe_noise: torch.Tensor | None = None,
+        return_diagnostics: bool = False,
+        debug_block_indices: Sequence[int] | None = None,
     ):
         del tiled
         video = sample["video"].to(
@@ -571,6 +577,8 @@ class FastWAMH3(nn.Module):
                 self.train_action_scheduler.num_train_timesteps
             ),
             detach_h3_for_action=self.stop_action_gradient_to_h3,
+            return_debug=bool(return_diagnostics),
+            debug_block_indices=debug_block_indices,
         )
         video_prediction = predictions["video_prediction"]
         action_prediction = predictions["action_prediction"]
@@ -607,12 +615,23 @@ class FastWAMH3(nn.Module):
         sigma_action = action_timestep.float() / float(
             self.train_action_scheduler.num_train_timesteps
         )
-        return loss, {
+        metrics = {
             "loss_video": float(loss_video.detach()),
             "loss_action": float(loss_action.detach()),
             "base_progress_mean": float(base_progress.mean()),
             "sigma_video_mean": float(sigma_video.mean()),
             "sigma_action_mean": float(sigma_action.mean()),
+        }
+        if not return_diagnostics:
+            return loss, metrics
+        return loss, metrics, {
+            "loss_video": loss_video,
+            "loss_action": loss_action,
+            "base_progress": base_progress.detach(),
+            "video_noise": video_noise.detach(),
+            "action_noise": action_noise.detach(),
+            "keyframe_noise": keyframe_noise.detach(),
+            "h3_hidden_by_block": predictions["debug"]["h3_hidden_by_block"],
         }
 
     @torch.no_grad()

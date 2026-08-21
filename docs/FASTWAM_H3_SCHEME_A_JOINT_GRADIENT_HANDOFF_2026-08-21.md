@@ -49,16 +49,27 @@ All review follow-up engineering fixes were also completed:
 5. Fingerprint documentation now distinguishes manifest/index fingerprints
    from actual shard-byte SHA256.
 6. The 100k optimizer-step budget is explicitly documented as intentional.
+7. Optimizer-step loss logging is now the exact sample-weighted mean over every
+   microbatch and every rank, rather than only the final microbatch.
+8. CUDA peak allocated/reserved memory is logged at each optimizer step.
+9. A reusable real-H3 diagnostic now reports per-loss LoRA gradients, beta
+   sweeps, robust local LoRA perturbation, and five-frame latent rollout error.
+10. A distributed memory-smoke entry point can conservatively pad cached Qwen
+    rows to test condition-length headroom.
+11. H3 inference now accepts unbatched cached Qwen rows by batching embeddings,
+    tags, and masks consistently; the diagnostic exposed the previous mismatch.
 
 Final automated result:
 
 ```text
-88 passed, 1 environment warning
+96 passed, 1 environment warning
 python compileall: pass
 git diff --check: pass
 ```
 
-The warning is the existing `pynvml` deprecation warning.
+The warning is the existing `pynvml` deprecation warning. Running unscoped
+`pytest` also discovers two vendored RoboTwin scripts that require optional
+`sapien`; the repository-owned command is `pytest tests`.
 
 ## 2. Why joint gradient is the correct baseline
 
@@ -218,6 +229,22 @@ samples_per_sec = (
 
 The logger and experiment tracking payload now use this formula.
 
+The loss payload was also corrected. Previously, with accumulation 8, one
+logged optimizer step contained only the final microbatch loss. Training
+gradients were correct, but `train/loss`, `loss_video`, and `loss_action` were
+noisier than their labels implied. The trainer now accumulates each scalar
+weighted by local batch size, gathers sums and sample counts across ranks, and
+logs:
+
+```text
+sum(metric * local_microbatch_size over every microbatch and rank)
+-----------------------------------------------------------------
+sum(local_microbatch_size over every microbatch and rank)
+```
+
+This remains exact for a short final batch and is covered by
+`tests/test_trainer_accumulation_metrics.py`.
+
 Important correction to the review discussion: the earlier B=1/B=2 benchmark
 commands explicitly set:
 
@@ -288,11 +315,8 @@ At step 10:
 
 This is approximately 36% faster than B=1/no-GC.
 
-The previously measured memory range is:
-
-```text
-95.4--96.2 GiB used / 97.9 GiB
-```
+The earlier NVML numbers mixed decimal GB and binary GiB. The trainer now
+reports PyTorch peak memory directly in binary GiB.
 
 ### 7.4 Final production accumulation smoke
 
@@ -329,17 +353,35 @@ The global effective batch remains:
 
 The selected fastest verified setting is therefore B=2/no-GC/accumulation=8.
 
-Risk: B=2 has only approximately 1.7--2.4 GiB of memory headroom. It passed the
-10-step benchmark and the full accumulated optimizer-step smoke test. If a long
-run encounters OOM due to fragmentation or an unexpected allocation peak, the
-safe fallback is:
+The pre-100k rerun used the current code, real cache, and an explicit
+`--num_processes 8` launcher override. It completed one full accumulated step:
 
-```yaml
-batch_size: 1
-gradient_accumulation_steps: 16
+```text
+world size              = 8
+cache row range scanned = 125--140
+loss                    = 2.0511
+loss_action             = 1.7643
+loss_video              = 0.2868
+peak allocated          = 90.08 GiB
+peak reserved           = 92.97 GiB
+device capacity         = 95.08 GiB
 ```
 
-which preserves global batch 128.
+The one-step 3.95 samples/s value includes startup and is not a replacement for
+the sustained 2.38 samples/s benchmark.
+
+A deliberately out-of-distribution 192-row condition smoke failed in backward
+with only about 10 MiB free. This is useful boundary evidence, but it does not
+describe the current dataset: all 39,677 cache files present during the scan
+were between 125 and 140 rows, and the observed maximum was 140. Therefore B=2
+is accepted for the current immutable cache schema/data distribution, but any
+future prompt template, image tokenization, or cache row-length increase must
+repeat the memory smoke.
+
+An initial set of memory-smoke commands accidentally inherited
+`num_processes: 1` from the Accelerate config. Their single-GPU OOM results were
+discarded. Only the explicit world-size-8 run above is used for the production
+decision.
 
 ## 8. Checkpoint duplicate-save fix
 
@@ -458,12 +500,128 @@ This is not an unresolved choice. `EXPERIMENT_37.md` records that the user
 explicitly confirmed a total budget of 100k optimizer steps with a checkpoint
 every 10k steps. Long-run validation should still monitor late overfitting.
 
-## 12. Automated and real-system verification
+## 12. Pre-100k joint-gradient diagnostics
+
+### 12.1 Reproducible diagnostic entry point
+
+`scripts/diagnose_h3_joint_gradient.py` loads the real frozen H3 33B base, all
+100 rank-32 LoRA branches, the real Action Expert checkpoint, and cached native
+Qwen conditions. It fixes model initialization and diffusion-noise seeds before
+measuring:
+
+1. `g_video` and `g_action` separately on H3 LoRA parameters in blocks 0, 24,
+   and 49;
+2. gradient norm ratio and cosine;
+3. analytic beta sweeps for 1, 0.1, 0.01, and 0.001;
+4. local LoRA-output/base-output RMS after one reversible LoRA-only AdamW probe;
+5. full 20-point five-frame latent denoising rollout error.
+
+The production model is restored after the reversible probe. Diagnostic JSON
+artifacts are stored under `artifacts/`.
+
+### 12.2 Three-sample gradient result
+
+The deterministic beta=1 probes produced:
+
+```text
+sample  block 0 ratio  block 24 ratio  block 49 ratio
+0       4155.8x        77.1x           4.57x
+1       2856.5x        67.2x           7.80x
+2       2759.2x        98.2x           8.11x
+```
+
+The corresponding cosines were:
+
+```text
+sample  block 0      block 24     block 49
+0        0.00027     -0.05546      0.00085
+1       -0.01345     -0.01022     -0.00001
+2        0.00475      0.06229      0.00500
+```
+
+Therefore the action and video gradients are consistently near-orthogonal at
+the selected layers. The early-layer action gradient is not just larger; it
+points in a largely independent direction.
+
+For sample 0, scaling only the Action-to-H3 path would give:
+
+```text
+beta   block 0 scaled ratio  block 24 scaled ratio  block 49 scaled ratio
+1      4155.8x               77.11x                 4.566x
+0.1     415.6x                7.711x                0.457x
+0.01     41.6x                0.771x                0.0457x
+0.001     4.16x               0.077x                0.00457x
+```
+
+No single global beta balances every depth: beta 0.01 balances the middle block
+but still leaves block 0 action-dominated, while beta 0.001 still leaves block
+0 at 2.8--4.2x across the three samples and nearly removes Action-to-H3 in late
+blocks.
+
+### 12.3 Representation probe and a rejected metric
+
+Comparing hidden states from two separate BF16 H3 forwards initially appeared
+to show about 12% relative drift at block 49 after one update. An LR=0 no-op
+control showed the same magnitude. This means repeated-forward hidden
+difference is dominated by BF16/attention numerical non-determinism and is not
+a valid update-drift metric in this environment.
+
+The robust replacement measures each LoRA projection's output and frozen base
+projection output inside the same forward. After one beta=1, LR=1e-4 LoRA-only
+AdamW probe, all six selected projection ratios were only:
+
+```text
+3.04e-5 to 4.31e-5
+```
+
+The LR=0 no-op control was exactly zero. Beta 0 and beta 0.001 produced similar
+first-step magnitudes because Adam's first update largely normalizes gradient
+scale; beta primarily changes direction at this point. This is why raw norm
+ratios alone are insufficient to predict immediate representation damage.
+
+### 12.4 Five-frame latent rollout
+
+The full 20-point latent-only denoising result for deterministic sample 0 was:
+
+```text
+latent shape = [24, 2, 14, 28]
+L1           = 0.30362
+MSE/L2       = 0.29163
+relative L2  = 0.56162
+cosine       = 0.84087
+```
+
+This is a pre-training baseline, not a quality target. It verifies that the
+complete five-frame latent rollout path runs without invoking the unsupported
+pixel decoder and gives a checkpoint-comparable metric.
+
+The first rollout attempt exposed an inference API bug: two-dimensional cached
+embeddings were automatically batched, but one-dimensional token tags and
+masks were not. `_prepare_text_condition()` now batches all three consistently,
+and `test_inference_accepts_unbatched_cached_qwen_rows` covers the contract.
+
+### 12.5 Beta decision
+
+The production configuration remains beta=1 implicitly through:
+
+```yaml
+stop_action_gradient_to_h3: false
+```
+
+This preserves the explicitly requested original FastWAM optimization
+topology. The diagnostics do not justify silently changing the baseline to a
+new beta: the gradient imbalance is real, but one-step local LoRA perturbation
+is small, and a global beta cannot balance all depths. The appropriate next
+step is a short beta=1 training canary with the corrected accumulated loss and
+peak-memory logs, followed by checkpoint diagnostics. A beta or layer-wise
+scaling mechanism remains a research ablation if the video objective degrades.
+
+## 13. Automated and real-system verification
 
 Automated:
 
 ```text
-88 passed, 1 warning
+96 passed, 1 warning
 python compileall: pass
 git diff --check: pass
 ```
@@ -475,6 +633,8 @@ joint-gradient B=1/no-GC 10 steps: pass
 joint-gradient B=1/GC 3 steps: pass
 joint-gradient B=2/no-GC 10 steps: pass
 joint-gradient B=2/accumulation=8 optimizer step: pass
+current-code real-cache B=2/accumulation=8 optimizer step: pass
+synthetic 192-row B=2 boundary smoke: expected OOM
 all observed losses finite
 ```
 
@@ -491,12 +651,12 @@ optimizer/scheduler/random/dataloader restore
 continue to next optimizer step
 ```
 
-## 13. Current cache and large-run state
+## 14. Current cache and large-run state
 
 The obsolete stop-gradient cache-to-training shell chain was stopped before it
 could launch training with the old baseline.
 
-Full Qwen schema-3 cache generation resumed with:
+Full Qwen schema-3 cache generation uses:
 
 ```text
 world size: 8
@@ -504,15 +664,19 @@ cache batch size: 1
 overwrite: false
 ```
 
-At 2026-08-21 14:36 UTC+8:
+It was intentionally paused while the GPUs ran the diagnostics in this
+handoff. At the row-length scan:
 
 ```text
-cache process: running
-cache directory size: approximately 44 GiB
-GPU memory: approximately 50.5 GiB on each of 8 GPUs
+completed cache files: 39,677
+row length range: 125--140
+maximum row length: 140
 ```
 
 `overwrite=false` preserves completed entries and resumes missing cache entries.
+The eight-rank cache process was resumed at 2026-08-21 16:38 UTC+8 after the
+diagnostics completed. No formal 100k training process was launched during
+these diagnostics.
 
 The intended formal training run is:
 
@@ -535,7 +699,7 @@ model:
   mot_checkpoint_mixed_attn: false
 ```
 
-## 14. Files changed in this handoff
+## 15. Files changed in this handoff
 
 Configuration:
 
@@ -545,6 +709,7 @@ Configuration:
 Model/runtime:
 
 - `src/fastwam/models/minimax_h3/fastwam.py`
+- `src/fastwam/models/minimax_h3/video_dit.py`
 - `src/fastwam/runtime.py`
 
 Trainer/data:
@@ -553,11 +718,26 @@ Trainer/data:
 - `src/fastwam/datasets/padding.py`
 - `src/fastwam/datasets/lerobot/robot_video_dataset.py`
 
+Diagnostic scripts and artifacts:
+
+- `scripts/diagnose_h3_joint_gradient.py`
+- `scripts/smoke_h3_b2_memory.py`
+- `artifacts/h3_joint_diagnostic_sample0_beta1.json`
+- `artifacts/h3_joint_local_probe_sample1_beta1.json`
+- `artifacts/h3_joint_local_probe_sample2_beta1.json`
+- `artifacts/h3_joint_local_probe_beta0.001.json`
+- `artifacts/h3_joint_local_probe_beta0.json`
+- `artifacts/h3_joint_local_probe_noop.json`
+
 Tests:
 
 - `tests/models/minimax_h3/test_runtime_config.py`
 - `tests/models/minimax_h3/test_mixed_attention.py`
 - `tests/models/minimax_h3/test_dataset_padding.py`
+- `tests/models/minimax_h3/test_inference_contract.py`
+- `tests/models/minimax_h3/test_joint_gradient_diagnostics.py`
+- `tests/models/minimax_h3/test_training_contract.py`
+- `tests/test_trainer_accumulation_metrics.py`
 - `tests/test_trainer_h3_eval.py`
 
 Updated prior handoffs:
@@ -565,17 +745,18 @@ Updated prior handoffs:
 - `docs/FASTWAM_H3_SCHEME_A_PRODUCTION_INTEGRATION_REVIEW_2026-08-21.md`
 - `docs/FASTWAM_H3_SCHEME_A_VERIFICATION_HANDOFF_2026-08-20.md`
 
-## 15. Reviewer checklist
+## 16. Reviewer checklist
 
 1. Confirm that `stop_action_gradient_to_h3=false` is propagated from Hydra
    config through runtime construction into every mixed-attention block.
 2. Confirm that H3 still cannot read Action tokens in the forward pass.
 3. Confirm that the default action-loss backward path reaches H3 LoRA but not
    frozen H3 base parameters.
-4. Review whether the approximately 2010x early-layer gradient ratio requires a
-   `beta` scaling ablation before or during the first long run.
-5. Review the B=2 memory risk and whether 1.7--2.4 GiB headroom is acceptable
-   for a 100k-step run.
+4. Review the three-sample block-0 ratios of 2759--4156x, near-zero gradient
+   cosines, and the conclusion to keep beta=1 for the FastWAM-like baseline.
+5. Confirm the current-cache B=2 peak of 90.08 GiB allocated / 92.97 GiB
+   reserved on 95.08-GiB devices and the requirement to rerun if cache rows
+   exceed the observed maximum of 140.
 6. Confirm that H3 latent-only evaluation never calls a five-frame pixel
    decoder.
 7. Confirm the dataset replacement threshold semantics and whether worker-local
@@ -584,3 +765,5 @@ Updated prior handoffs:
    acceptable for this run.
 9. Confirm that 100k optimizer steps, approximately 46.1 traversals, is the
    intended experiment budget recorded in `EXPERIMENT_37.md`.
+10. Confirm accumulation-window losses are reduced using exact sample-weighted
+    sums/counts across every microbatch and rank.

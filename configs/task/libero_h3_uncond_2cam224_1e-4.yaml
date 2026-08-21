@@ -18,8 +18,10 @@ data:
     skip_padding_as_possible: true
     max_padding_retry: 50
 
-# B=1 without mixed-attention activation checkpointing is the fastest stable
-# 8xH20 setting. B=2 reaches roughly 96 GiB/device and is too close to OOM.
+# B=2/no-GC is the fastest verified 8xH20 setting (~2.38 samples/s).
+# A real-cache accumulation=8 step peaked at 90.08 GiB allocated / 92.97 GiB
+# reserved on 95.08-GiB GPUs. Current cache rows max at 140; synthetic 192-row
+# conditions OOM, so condition-length growth requires a new memory smoke.
 batch_size: 2
 num_workers: 4
 
@@ -27,8 +29,8 @@ model:
   # Training reads exact Qwen layer-50 f0+instruction rows from the native
   # cache so the 32B encoder and H3 Video Expert never share one GPU.
   load_text_encoder: false
-  # Sustained 8xH20 benchmark: 1.67 samples/s without checkpointing versus
-  # 1.51 samples/s with checkpointing. B=1 retains safe memory headroom.
+  # Joint-gradient benchmark: B=2/no-GC reaches ~2.38 samples/s versus
+  # B=1/no-GC at ~1.75 and B=1/GC at ~1.50 samples/s.
   mot_checkpoint_mixed_attn: false
   # The 32 action rows cover the four transitions of five visual frames.
   # On H3's native 24-fps RoPE clock, eight controls per visual interval
@@ -49,7 +51,7 @@ max_checkpoints: 2
 # Full-video and action flow-matching losses are both active in Scheme A.
 eval_every: 0
 
-# 1 sample/GPU x 8 GPUs x 16 accumulation steps keeps global batch 128.
+# 2 samples/GPU x 8 GPUs x 8 accumulation steps keeps global batch 128.
 gradient_accumulation_steps: 8
 weight_decay: 1.0e-2
 # Action-only H3 checkpoints use the incompatible pre-Scheme-A schema.

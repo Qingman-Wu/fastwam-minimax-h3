@@ -26,6 +26,64 @@ from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_s
 logger = get_logger(__name__)
 
 
+def _accumulate_sample_weighted_metrics(
+    sums: dict[str, torch.Tensor],
+    *,
+    loss: torch.Tensor,
+    loss_dict: dict,
+    batch_size: int,
+) -> int:
+    """Accumulate local metric sums over one gradient-accumulation window."""
+
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"`batch_size` must be positive, got {batch_size}")
+    values = {"loss": loss.detach()}
+    values.update(loss_dict)
+    for key, value in values.items():
+        metric = torch.as_tensor(
+            value,
+            device=loss.device,
+            dtype=torch.float32,
+        ).detach()
+        if metric.numel() != 1:
+            raise ValueError(
+                f"Accumulated metric {key!r} must be scalar, got {tuple(metric.shape)}"
+            )
+        weighted = metric.reshape(()) * batch_size
+        sums[key] = sums.get(key, torch.zeros_like(weighted)) + weighted
+    return batch_size
+
+
+def _reduce_accumulated_metrics(
+    accelerator,
+    sums: dict[str, torch.Tensor],
+    sample_count: int,
+) -> dict[str, float]:
+    """Reduce an accumulation window into exact global sample-weighted means."""
+
+    if sample_count <= 0 or not sums:
+        raise ValueError("Cannot reduce an empty accumulation window")
+    keys = sorted(sums)
+    local = torch.stack(
+        [sums[key] for key in keys]
+        + [
+            torch.tensor(
+                float(sample_count),
+                device=next(iter(sums.values())).device,
+                dtype=torch.float32,
+            )
+        ]
+    )
+    gathered = accelerator.gather(local).reshape(-1, len(keys) + 1)
+    global_totals = gathered.sum(dim=0)
+    global_count = global_totals[-1].clamp(min=1.0)
+    return {
+        key: float((global_totals[index] / global_count).item())
+        for index, key in enumerate(keys)
+    }
+
+
 class Wan22Trainer:
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
@@ -863,6 +921,10 @@ class Wan22Trainer:
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
+        accumulated_metric_sums: dict[str, torch.Tensor] = {}
+        accumulated_sample_count = 0
+        if self.accelerator.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.accelerator.device)
 
         while self.global_step < self.max_steps:
             try:
@@ -880,6 +942,18 @@ class Wan22Trainer:
 
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
+                sample_video = sample.get("video")
+                if not isinstance(sample_video, torch.Tensor) or sample_video.ndim < 1:
+                    raise TypeError(
+                        "Training samples must contain a batched `video` tensor "
+                        "for accumulation-window metric weighting"
+                    )
+                accumulated_sample_count += _accumulate_sample_weighted_metrics(
+                    accumulated_metric_sums,
+                    loss=loss,
+                    loss_dict=loss_dict,
+                    batch_size=int(sample_video.shape[0]),
+                )
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
@@ -889,17 +963,39 @@ class Wan22Trainer:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
-                    global_loss = float(
-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
+                    global_window_metrics = _reduce_accumulated_metrics(
+                        self.accelerator,
+                        accumulated_metric_sums,
+                        accumulated_sample_count,
                     )
-                    global_loss_metrics = {}
-                    for key, value in loss_dict.items():
-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
-                        global_loss_metrics[key] = float(
-                            self.accelerator.gather(metric_tensor).mean().item()
-                        )
+                    global_loss = global_window_metrics.pop("loss")
+                    global_loss_metrics = global_window_metrics
+                    accumulated_metric_sums = {}
+                    accumulated_sample_count = 0
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                    if self.accelerator.device.type == "cuda":
+                        peak_allocated = torch.tensor(
+                            torch.cuda.max_memory_allocated(self.accelerator.device)
+                            / (1024**3),
+                            device=loss.device,
+                            dtype=torch.float32,
+                        ).reshape(1)
+                        peak_reserved = torch.tensor(
+                            torch.cuda.max_memory_reserved(self.accelerator.device)
+                            / (1024**3),
+                            device=loss.device,
+                            dtype=torch.float32,
+                        ).reshape(1)
+                        global_peak_allocated_gib = float(
+                            self.accelerator.gather(peak_allocated).max().item()
+                        )
+                        global_peak_reserved_gib = float(
+                            self.accelerator.gather(peak_reserved).max().item()
+                        )
+                    else:
+                        global_peak_allocated_gib = 0.0
+                        global_peak_reserved_gib = 0.0
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
@@ -914,13 +1010,15 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
+                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s peak=%.2f/%.2f GiB eta=%s" % (
                             current_lr,
                             steps_per_sec,
                             steps_per_sec
                             * self.batch_size
                             * self.accelerator.num_processes
                             * self.gradient_accumulation_steps,
+                            global_peak_allocated_gib,
+                            global_peak_reserved_gib,
                             eta_str,
                         )
                         logger.info(description)
@@ -934,6 +1032,8 @@ class Wan22Trainer:
                             * self.batch_size
                             * self.accelerator.num_processes
                             * self.gradient_accumulation_steps,
+                            "performance/peak_allocated_gib": global_peak_allocated_gib,
+                            "performance/peak_reserved_gib": global_peak_reserved_gib,
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value

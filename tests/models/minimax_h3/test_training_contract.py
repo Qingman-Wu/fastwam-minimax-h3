@@ -47,10 +47,18 @@ class TinyJointVideoExpert(nn.Module):
 
     def forward_joint(self, **kwargs):
         self.last_inputs = kwargs
-        return {
+        output = {
             "video_prediction": torch.zeros_like(kwargs["noisy_video_latents"]),
             "action_prediction": torch.zeros_like(kwargs["noisy_action_tokens"]),
         }
+        if kwargs.get("return_debug"):
+            output["debug"] = {
+                "h3_hidden_by_block": {
+                    int(index): torch.full((1, 2, 2), float(index))
+                    for index in kwargs.get("debug_block_indices", ())
+                }
+            }
+        return output
 
 
 def make_model(first_latent_value=1.0):
@@ -115,6 +123,26 @@ def test_training_encodes_full_video_once_and_keyframe_separately():
     assert inputs["clean_keyframe_latents"].data_ptr() != inputs[
         "noisy_video_latents"
     ].data_ptr()
+
+
+def test_training_diagnostics_return_tensor_losses_and_h3_snapshots():
+    model = make_model()
+
+    loss, metrics, diagnostics = model.training_loss(
+        make_sample(),
+        base_progress=torch.tensor([0.5]),
+        video_noise=torch.zeros(1, 2, 2, 2, 2),
+        action_noise=torch.zeros(1, 4, 3),
+        keyframe_noise=torch.zeros(1, 2, 1, 2, 2),
+        return_diagnostics=True,
+        debug_block_indices=[0],
+    )
+
+    assert loss.ndim == 0
+    assert diagnostics["loss_video"].ndim == 0
+    assert diagnostics["loss_action"].ndim == 0
+    assert diagnostics["h3_hidden_by_block"][0].shape == (1, 2, 2)
+    assert metrics["loss_video"] == float(diagnostics["loss_video"])
 
 
 def test_video_loss_includes_first_temporal_latent():
@@ -251,6 +279,7 @@ def test_real_tiny_experts_checkpoint_action_when_frozen_video_is_eval(monkeypat
         video_fps=24.0,
         action_fps=8.0,
         return_debug=True,
+        debug_block_indices=[0],
     )
 
     assert output["video_prediction"].shape == (2, 2, 2, 4, 4)
@@ -260,6 +289,7 @@ def test_real_tiny_experts_checkpoint_action_when_frozen_video_is_eval(monkeypat
     assert output["debug"]["keyframe_rows"] == 4
     assert output["debug"]["video_target_rows"] == 8
     assert output["debug"]["audio_rows"] == 0
+    assert output["debug"]["h3_hidden_by_block"][0].shape == (2, 15, 8)
     assert torch.allclose(
         output["debug"]["action_progress"], torch.tensor([0.7, 0.4])
     )

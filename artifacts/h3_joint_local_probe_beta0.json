@@ -1,0 +1,196 @@
+{
+  "gradient_by_block": {
+    "0": {
+      "action_grad_norm": 19.165864079028015,
+      "action_to_video_norm_ratio": 4139.114174236134,
+      "beta_sweep": {
+        "0.001": {
+          "combined_to_video_norm_ratio": 4.257941581555892,
+          "combined_video_cosine": 0.2345969673743386,
+          "scaled_action_to_video_norm_ratio": 4.139114174236134
+        },
+        "0.01": {
+          "combined_to_video_norm_ratio": 41.40295422288185,
+          "combined_video_cosine": 0.02388722837450305,
+          "scaled_action_to_video_norm_ratio": 41.39114174236135
+        },
+        "0.1": {
+          "combined_to_video_norm_ratio": 413.91235969717405,
+          "combined_video_cosine": 0.002150257676919571,
+          "scaled_action_to_video_norm_ratio": 413.9114174236135
+        },
+        "1": {
+          "combined_to_video_norm_ratio": 4139.11402932162,
+          "combined_video_cosine": -2.4115718771083195e-05,
+          "scaled_action_to_video_norm_ratio": 4139.114174236134
+        }
+      },
+      "cosine": -0.000265713305696752,
+      "video_grad_norm": 0.004630426529020557
+    },
+    "24": {
+      "action_grad_norm": 0.3048183109800611,
+      "action_to_video_norm_ratio": 77.19685524674587,
+      "beta_sweep": {
+        "0.001": {
+          "combined_to_video_norm_ratio": 0.9987991798205762,
+          "combined_video_cosine": 0.9970174622630577,
+          "scaled_action_to_video_norm_ratio": 0.07719685524674587
+        },
+        "0.01": {
+          "combined_to_video_norm_ratio": 1.2297723031119978,
+          "combined_video_cosine": 0.7791704475101328,
+          "scaled_action_to_video_norm_ratio": 0.7719685524674587
+        },
+        "0.1": {
+          "combined_to_video_norm_ratio": 7.730303313253446,
+          "combined_video_cosine": 0.07529101174019322,
+          "scaled_action_to_video_norm_ratio": 7.719685524674587
+        },
+        "1": {
+          "combined_to_video_norm_ratio": 77.1491730813578,
+          "combined_video_cosine": -0.04121594954119033,
+          "scaled_action_to_video_norm_ratio": 77.19685524674587
+        }
+      },
+      "cosine": -0.054144387248753825,
+      "video_grad_norm": 0.0039485845635261205
+    },
+    "49": {
+      "action_grad_norm": 0.023990517837894913,
+      "action_to_video_norm_ratio": 4.566404585122915,
+      "beta_sweep": {
+        "0.001": {
+          "combined_to_video_norm_ratio": 1.000014327146559,
+          "combined_video_cosine": 0.9999895742265876,
+          "scaled_action_to_video_norm_ratio": 0.004566404585122914
+        },
+        "0.01": {
+          "combined_to_video_norm_ratio": 1.0010810304660667,
+          "combined_video_cosine": 0.9989591070087182,
+          "scaled_action_to_video_norm_ratio": 0.04566404585122914
+        },
+        "0.1": {
+          "combined_to_video_norm_ratio": 1.09968211457007,
+          "combined_video_cosine": 0.909708459492954,
+          "scaled_action_to_video_norm_ratio": 0.45664045851229146
+        },
+        "1": {
+          "combined_to_video_norm_ratio": 4.675452200865861,
+          "combined_video_cosine": 0.21471746061033575,
+          "scaled_action_to_video_norm_ratio": 4.566404585122915
+        }
+      },
+      "cosine": 0.0008543316086430731,
+      "video_grad_norm": 0.0052536995771366056
+    },
+    "selected_blocks_aggregate": {
+      "action_grad_norm": 19.16830288897354,
+      "action_to_video_norm_ratio": 2384.2661237256116,
+      "beta_sweep": {
+        "0.001": {
+          "combined_to_video_norm_ratio": 2.584953007511585,
+          "combined_video_cosine": 0.38632367716044136,
+          "scaled_action_to_video_norm_ratio": 2.3842661237256118
+        },
+        "0.01": {
+          "combined_to_video_norm_ratio": 23.863048126706943,
+          "combined_video_cosine": 0.0413310783371529,
+          "scaled_action_to_video_norm_ratio": 23.842661237256117
+        },
+        "0.1": {
+          "combined_to_video_norm_ratio": 238.42813424108596,
+          "combined_video_cosine": 0.003618931623267544,
+          "scaled_action_to_video_norm_ratio": 238.42661237256118
+        },
+        "1": {
+          "combined_to_video_norm_ratio": 2384.2657582257584,
+          "combined_video_cosine": -0.00015579171487114778,
+          "scaled_action_to_video_norm_ratio": 2384.2661237256116
+        }
+      },
+      "cosine": -0.0005752079591851714,
+      "video_grad_norm": 0.008039498065350814
+    }
+  },
+  "latent_rollout": null,
+  "peak_allocated_gib": 79.50550556182861,
+  "peak_reserved_gib": 80.150390625,
+  "probe": {
+    "action_beta": 0.0,
+    "baseline_loss_metrics": {
+      "base_progress_mean": 0.6129598617553711,
+      "loss_action": 1.1163971424102783,
+      "loss_video": 0.18795444071292877,
+      "sigma_action_mean": 0.8880000710487366,
+      "sigma_video_mean": 0.9520000219345093
+    },
+    "learning_rate": 0.0001,
+    "lora_only": true,
+    "optimizer": "AdamW",
+    "updated_loss_metrics": {
+      "base_progress_mean": 0.6129598617553711,
+      "loss_action": 1.21834397315979,
+      "loss_video": 0.1901237964630127,
+      "sigma_action_mean": 0.8880000710487366,
+      "sigma_video_mean": 0.9520000219345093
+    },
+    "weight_decay": 0.01
+  },
+  "representation_probe": {
+    "local_lora_output_after_one_probe_step": {
+      "blocks.0.attn.out_proj": {
+        "base_output_rms": 23.091102600097656,
+        "lora_output_rms": 0.0008196434355340898,
+        "lora_to_base_rms_ratio": 3.549607208697125e-05
+      },
+      "blocks.0.attn.qkv_proj": {
+        "base_output_rms": 3.725130796432495,
+        "lora_output_rms": 0.00014782360813114792,
+        "lora_to_base_rms_ratio": 3.9682796341367066e-05
+      },
+      "blocks.24.attn.out_proj": {
+        "base_output_rms": 94.42359924316406,
+        "lora_output_rms": 0.003393166698515415,
+        "lora_to_base_rms_ratio": 3.593557994463481e-05
+      },
+      "blocks.24.attn.qkv_proj": {
+        "base_output_rms": 11.088289260864258,
+        "lora_output_rms": 0.0004246176977176219,
+        "lora_to_base_rms_ratio": 3.8294248952297494e-05
+      },
+      "blocks.49.attn.out_proj": {
+        "base_output_rms": 876.2240600585938,
+        "lora_output_rms": 0.026633188128471375,
+        "lora_to_base_rms_ratio": 3.0395407520700246e-05
+      },
+      "blocks.49.attn.qkv_proj": {
+        "base_output_rms": 72.79913330078125,
+        "lora_output_rms": 0.0026899201329797506,
+        "lora_to_base_rms_ratio": 3.6949892091797665e-05
+      }
+    },
+    "repeated_forward_hidden_difference": {
+      "0": {
+        "cosine": 0.9999980681645043,
+        "relative_l2": 0.0019656886280439885,
+        "rms": 0.2755357262690047
+      },
+      "24": {
+        "cosine": 0.9997435174333693,
+        "relative_l2": 0.02265331108068837,
+        "rms": 14.333630887838375
+      },
+      "49": {
+        "cosine": 0.9928710647848152,
+        "relative_l2": 0.11944445870491528,
+        "rms": 1003.5854642649919
+      }
+    },
+    "warning": "Repeated BF16 H3 forwards have a large nonzero no-op floor; use local_lora_output_after_one_probe_step as the robust metric."
+  },
+  "sample_index": 0,
+  "schema_version": 1,
+  "seed": 42,
+  "stop_action_gradient_to_h3": false
+}
