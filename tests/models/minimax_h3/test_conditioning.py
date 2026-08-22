@@ -12,6 +12,7 @@ from fastwam.models.minimax_h3.text_encoder import (
 )
 from fastwam.models.minimax_h3.video_dit import (
     MiniMaxH3VideoBackbone,
+    load_h3_condition_refiner,
     load_h3_video_backbone,
 )
 from fastwam.models.minimax_h3.video_vae import (
@@ -177,6 +178,9 @@ def test_h3_loader_preserves_checkpoint_parameter_dtypes(tmp_path):
     loaded = load_h3_video_backbone(
         tmp_path, device="cpu", dtype=torch.bfloat16
     )
+    refiner = load_h3_condition_refiner(
+        tmp_path, device="cpu", dtype=torch.bfloat16
+    )
 
     assert loaded.video_patch_proj.weight.dtype == torch.float32
     assert loaded.condition_proj.weight.dtype == torch.bfloat16
@@ -185,7 +189,16 @@ def test_h3_loader_preserves_checkpoint_parameter_dtypes(tmp_path):
     logits = loaded.final_layer(
         torch.randn(1, 2, 12, dtype=torch.bfloat16), time
     )
-    assert patches.dtype == time.dtype == logits.dtype == torch.bfloat16
+    assert patches.dtype == torch.bfloat16
+    assert time.dtype == torch.float32
+    assert logits.dtype == torch.float32
+    embeddings = torch.randn(4, 5, dtype=torch.bfloat16)
+    tags = torch.tensor([0, 1, 1, 0])
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    assert torch.equal(
+        refiner(embeddings, cu),
+        loaded.refine_text_condition(embeddings, tags, cu),
+    )
 
 
 def test_h3_attention_lora_starts_as_noop_and_keeps_base_frozen():

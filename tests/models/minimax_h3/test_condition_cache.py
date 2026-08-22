@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import pytest
 import torch
 
@@ -8,6 +11,13 @@ from fastwam.datasets.h3_condition_cache import (
     load_h3_condition_cache,
     load_h3_condition_cache_file,
     save_h3_condition_cache,
+)
+from fastwam.models.minimax_h3.text_encoder import (
+    H3_QWEN_ENCODER_SIGNATURE,
+    H3_QWEN_PRESENTATION_SIGNATURE,
+)
+from fastwam.models.minimax_h3.video_dit import (
+    H3_CONDITION_REFINER_IMPLEMENTATION_SIGNATURE,
 )
 
 
@@ -183,3 +193,61 @@ def test_h3_condition_collate_pads_variable_qwen_lengths_without_valid_padding()
         [True, True, True],
     ]
     assert torch.equal(batch["prompt_embeds"][0, 2], torch.zeros(5120))
+
+
+def test_post_refiner_cache_requires_bfloat16_and_content_checksum(tmp_path):
+    source_manifest = initialize_h3_condition_cache(
+        tmp_path / "source",
+        qwen_checkpoint_fingerprint="sha256:qwen-a",
+        processor_fingerprint="sha256:processor-a",
+    )
+    refined_dir = tmp_path / "refined"
+    refined_dir.mkdir()
+    manifest = {
+        "schema_version": 4,
+        "source_manifest": source_manifest,
+        "source_manifest_sha256": "sha256:source",
+        "refiner_fingerprint": "sha256:refiner",
+        "refiner_artifact_stat_signature": "sha256:refiner-stat",
+        "refiner_implementation_signature": (
+            H3_CONDITION_REFINER_IMPLEMENTATION_SIGNATURE
+        ),
+        "qwen_weight_shards_fingerprint": "sha256:qwen-shards",
+        "qwen_weight_shards_stat_signature": "sha256:qwen-stat",
+        "qwen_encoder_signature": H3_QWEN_ENCODER_SIGNATURE,
+        "qwen_presentation_signature": H3_QWEN_PRESENTATION_SIGNATURE,
+        "embedding_width": 5376,
+        "embedding_dtype": "torch.bfloat16",
+        "implementation_signature": "fastwam-h3-post-refiner-v3",
+    }
+    (refined_dir / "h3-post-refiner-cache-manifest.json").write_text(
+        json.dumps(manifest)
+    )
+    embeddings = torch.randn(2, 5376, dtype=torch.bfloat16)
+    tags = torch.tensor([0, 1])
+    digest = hashlib.sha256()
+    for tensor in (embeddings, tags):
+        value = tensor.contiguous()
+        digest.update(str(value.dtype).encode())
+        digest.update(str(tuple(value.shape)).encode())
+        digest.update(memoryview(value.view(torch.uint8).numpy()))
+    path = refined_dir / "sample.h3-post-refiner-v4.pt"
+    torch.save(
+        {
+            "schema_version": 4,
+            "refiner_fingerprint": "sha256:refiner",
+            "prompt_embeds": embeddings,
+            "prompt_token_tags": tags,
+            "payload_sha256": f"sha256:{digest.hexdigest()}",
+        },
+        path,
+    )
+
+    loaded = load_h3_condition_cache_file(path, manifest=manifest)
+    assert loaded["prompt_embeds"].shape == (2, 5376)
+
+    payload = torch.load(path, weights_only=True)
+    payload["prompt_embeds"][0, 0] += 1
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="checksum"):
+        load_h3_condition_cache_file(path, manifest=manifest)

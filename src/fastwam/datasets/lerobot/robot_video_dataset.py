@@ -19,6 +19,7 @@ from ..h3_condition_cache import (
     collate_h3_condition_samples,
     load_h3_condition_cache,
 )
+from ..h3_vae_cache import load_h3_vae_cache
 from ..padding import (
     fetch_unpadded_temporal_sample_with_index,
     validate_replacement_rate,
@@ -42,6 +43,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         processor=None,
         text_embedding_cache_dir=None,
         h3_condition_cache_dir=None,
+        h3_vae_cache_dir=None,
         context_len=128,
         pretrained_norm_stats=None,
         val_set_proportion=0.05,
@@ -80,6 +82,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
         self.h3_condition_cache_dir = h3_condition_cache_dir
+        self.h3_vae_cache_dir = h3_vae_cache_dir
         if (
             self.text_embedding_cache_dir is not None
             and self.h3_condition_cache_dir is not None
@@ -303,6 +306,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     first_frame=video[:, 0],
                     instruction=instruction,
                 )
+            )
+        if self.h3_vae_cache_dir is not None:
+            data.update(
+                load_h3_vae_cache(self.h3_vae_cache_dir, video=video)
             )
         return data
 

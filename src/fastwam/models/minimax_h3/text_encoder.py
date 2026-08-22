@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,11 +20,37 @@ H3_QWEN_HIDDEN_LAYER = 50
 H3_QWEN_ENCODER_SIGNATURE = (
     "qwen3-vl-4.57.6:layers-0-49:final-norm-identity:last-hidden-state"
 )
+H3_QWEN_PRESENTATION_SIGNATURE = (
+    "picture-1-prefix:vision-start-image-pad-vision-end:"
+    "prefix-text-tag:vision-video-tag:suffix-text-tag"
+)
 H3_VIDEO_TAG = 0
 H3_TEXT_TAG = 1
 
 
-def h3_qwen_artifact_fingerprints(model_path: str | Path) -> dict[str, str]:
+def _h3_qwen_weight_shard_paths(model_path: Path) -> tuple[Path, ...]:
+    index_path = model_path / "text_encoder/model.safetensors.index.json"
+    weight_map = json.loads(index_path.read_text())["weight_map"]
+    return tuple(
+        model_path / "text_encoder" / name
+        for name in sorted(set(weight_map.values()))
+    )
+
+
+def h3_qwen_weight_shards_stat_signature(model_path: str | Path) -> str:
+    model_path = Path(model_path)
+    digest = hashlib.sha256()
+    for path in _h3_qwen_weight_shard_paths(model_path):
+        stat = path.stat()
+        digest.update(
+            f"{path.name}\0{stat.st_size}\0{stat.st_mtime_ns}\0".encode()
+        )
+    return f"sha256:{digest.hexdigest()}"
+
+
+def h3_qwen_artifact_fingerprints(
+    model_path: str | Path, *, include_weight_shards: bool = False
+) -> dict[str, str]:
     model_path = Path(model_path)
 
     def fingerprint(relative_paths: tuple[str, ...]) -> str:
@@ -38,7 +65,7 @@ def h3_qwen_artifact_fingerprints(model_path: str | Path) -> dict[str, str]:
             digest.update(b"\0")
         return f"sha256:{digest.hexdigest()}"
 
-    return {
+    fingerprints = {
         "qwen_checkpoint_fingerprint": fingerprint(
             (
                 "text_encoder/config.json",
@@ -55,6 +82,16 @@ def h3_qwen_artifact_fingerprints(model_path: str | Path) -> dict[str, str]:
             )
         ),
     }
+    if include_weight_shards:
+        shard_paths = tuple(
+            str(path.relative_to(model_path))
+            for path in _h3_qwen_weight_shard_paths(model_path)
+        )
+        fingerprints["qwen_weight_shards_fingerprint"] = fingerprint(shard_paths)
+        fingerprints["qwen_weight_shards_stat_signature"] = (
+            h3_qwen_weight_shards_stat_signature(model_path)
+        )
+    return fingerprints
 
 
 @dataclass(frozen=True)

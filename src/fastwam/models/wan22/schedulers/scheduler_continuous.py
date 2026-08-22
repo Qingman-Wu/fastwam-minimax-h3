@@ -81,6 +81,7 @@ class WanContinuousFlowMatchScheduler:
         dtype: torch.dtype,
         shift_override: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        del dtype
         if num_inference_steps <= 0:
             raise ValueError(f"`num_inference_steps` must be positive, got {num_inference_steps}")
         shift = self.shift if shift_override is None else float(shift_override)
@@ -91,12 +92,60 @@ class WanContinuousFlowMatchScheduler:
         sigma_steps = self._phi(u_steps, shift)
         timesteps = sigma_steps[:-1] * float(self.num_train_timesteps)
         deltas = sigma_steps[1:] - sigma_steps[:-1]
-        return timesteps.to(dtype=dtype), deltas.to(dtype=dtype)
+        return timesteps, deltas
 
     @staticmethod
     def step(model_output: torch.Tensor, delta: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
-        delta = delta.to(sample.device, dtype=sample.dtype)
+        output_dtype = sample.dtype
+        compute_dtype = (
+            torch.float32
+            if sample.dtype in (torch.float16, torch.bfloat16)
+            else sample.dtype
+        )
+        sample_compute = sample.to(dtype=compute_dtype)
+        model_output_compute = model_output.to(
+            device=sample.device, dtype=compute_dtype
+        )
+        delta = delta.to(sample.device, dtype=compute_dtype)
         if delta.ndim == 0:
-            return sample + model_output * delta
-        delta = delta.view(-1, *([1] * (sample.ndim - 1)))
-        return sample + model_output * delta
+            updated = sample_compute + model_output_compute * delta
+        else:
+            delta = delta.view(-1, *([1] * (sample.ndim - 1)))
+            updated = sample_compute + model_output_compute * delta
+        return updated.to(dtype=output_dtype)
+
+    @staticmethod
+    def step_h3_video(
+        model_output: torch.Tensor,
+        timestep: torch.Tensor,
+        delta: torch.Tensor,
+        sample: torch.Tensor,
+        *,
+        timestep_scale: float = 1000.0,
+    ) -> torch.Tensor:
+        """Match MiniMax-H3's released FP32 x_t/x0 Euler update exactly."""
+
+        output_dtype = sample.dtype
+        compute_dtype = (
+            torch.float32
+            if sample.dtype in (torch.float16, torch.bfloat16)
+            else sample.dtype
+        )
+        sigma = timestep.to(sample.device, dtype=compute_dtype) / float(
+            timestep_scale
+        )
+        sigma_next = sigma + delta.to(sample.device, dtype=compute_dtype)
+        progress = 1.0 - sigma
+        sigma_from_progress = 1.0 - progress.to(dtype=output_dtype)
+        while sigma_from_progress.ndim < sample.ndim:
+            sigma_from_progress = sigma_from_progress.unsqueeze(-1)
+        denoised = sample - sigma_from_progress * model_output.to(
+            device=sample.device
+        )
+        ratio = sigma_next / sigma
+        while ratio.ndim < sample.ndim:
+            ratio = ratio.unsqueeze(-1)
+        updated = ratio * sample.to(dtype=compute_dtype) + (
+            1.0 - ratio
+        ) * denoised.to(dtype=compute_dtype)
+        return updated.to(dtype=output_dtype)

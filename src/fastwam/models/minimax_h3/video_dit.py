@@ -23,6 +23,13 @@ from .packed_sequence import (
 )
 
 
+H3_CONDITION_REFINER_IMPLEMENTATION_SIGNATURE = (
+    "fastwam-h3-condition-refiner-v3:"
+    "condition-proj-bf16:token-refiner-packed-cu-seqlens:"
+    "torch-rmsnorm:vision-tag-0:text-tag-1"
+)
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     left, right = torch.chunk(x, 2, dim=-1)
     return torch.cat((-right, left), dim=-1)
@@ -56,10 +63,17 @@ class H3RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        value = x.float()
-        value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + self.eps)
-        return value.to(dtype=dtype) * self.weight
+        rms_norm = getattr(F, "rms_norm", None)
+        if rms_norm is not None:
+            return rms_norm(
+                x, (self.weight.numel(),), self.weight, self.eps
+            )
+        # Compatibility for the repository's legacy test-only Torch 2.3
+        # environment. Production/cache environments use native rms_norm.
+        value = x * torch.rsqrt(
+            x.square().mean(dim=-1, keepdim=True) + self.eps
+        )
+        return value * self.weight
 
 
 class H3TimeEmbedder(nn.Module):
@@ -69,7 +83,10 @@ class H3TimeEmbedder(nn.Module):
         self.proj_in = nn.Linear(input_dim, hidden_size, bias=True)
         self.proj_out = nn.Linear(hidden_size, output_dim, bias=True)
 
-    def forward(self, timestep: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def forward(
+        self, timestep: torch.Tensor, dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        del dtype
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(
             -math.log(10000.0)
@@ -82,7 +99,10 @@ class H3TimeEmbedder(nn.Module):
         )
         hidden = self.proj_in(embedding)
         hidden = F.silu(hidden).to(self.proj_out.weight.dtype)
-        return self.proj_out(hidden).to(dtype)
+        # The released checkpoint keeps the complete timestep MLP in FP32.
+        # AdaLN modules activate this FP32 tensor and cast only immediately
+        # before their BF16 projection.
+        return self.proj_out(hidden)
 
 
 class H3RoPE(nn.Module):
@@ -300,6 +320,50 @@ class H3TokenRefiner(nn.Module):
         return self.final_norm(hidden)
 
 
+class H3ConditionRefiner(nn.Module):
+    """Frozen H3 context projection plus two-layer TokenRefiner."""
+
+    def __init__(
+        self,
+        *,
+        text_dim: int,
+        hidden_size: int,
+        token_refiner_num_layers: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        ffn_hidden_size: int,
+        norm_eps: float,
+        qk_norm_eps: float,
+        final_norm_eps: float,
+    ) -> None:
+        super().__init__()
+        self.text_dim = int(text_dim)
+        self.hidden_size = int(hidden_size)
+        self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
+        self.token_refiner = H3TokenRefiner(
+            token_refiner_num_layers,
+            hidden_size,
+            num_attention_heads,
+            attention_head_dim,
+            ffn_hidden_size,
+            norm_eps,
+            qk_norm_eps,
+            final_norm_eps,
+        )
+
+    def forward(
+        self, embeddings: torch.Tensor, cu_seqlens: torch.Tensor
+    ) -> torch.Tensor:
+        if embeddings.ndim != 2 or embeddings.shape[-1] != self.text_dim:
+            raise ValueError(
+                f"embeddings must be [S,{self.text_dim}], got {tuple(embeddings.shape)}"
+            )
+        projected = self.condition_proj(
+            embeddings.to(self.condition_proj.weight.dtype)
+        )
+        return self.token_refiner(projected, cu_seqlens.to(torch.int32))
+
+
 class H3AdaLNProjection(nn.Module):
     """Checkpoint-compatible three-modality H3 AdaLN projection."""
 
@@ -309,7 +373,8 @@ class H3AdaLNProjection(nn.Module):
         self.linear = nn.Linear(time_embed_dim, hidden_size * 6 * 3, bias=True)
 
     def forward(self, time_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        values = self.linear(F.silu(time_embedding))
+        activated = F.silu(time_embedding).to(self.linear.weight.dtype)
+        values = self.linear(activated)
         values = values.view(time_embedding.shape[0] * 3, 6, self.hidden_size)
         return values.unbind(dim=1)
 
@@ -414,7 +479,8 @@ class H3FinalLayer(nn.Module):
         time_embedding: torch.Tensor,
         inverse_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        shift, scale = self.adaln_proj.linear(F.silu(time_embedding)).chunk(2, dim=-1)
+        activated = F.silu(time_embedding).to(self.adaln_proj.linear.weight.dtype)
+        shift, scale = self.adaln_proj.linear(activated).chunk(2, dim=-1)
         if inverse_indices is not None:
             flat_indices = inverse_indices.reshape(-1).to(dtype=torch.long)
             shift = shift.index_select(0, flat_indices).view(*x.shape[:2], -1)
@@ -425,7 +491,8 @@ class H3FinalLayer(nn.Module):
         hidden = self.norm(x)
         hidden = hidden * (1 + scale) + shift
         logits = self.video_out(hidden.to(self.video_out.weight.dtype))
-        return logits.to(x.dtype)
+        # Official H3 returns velocity in the FP32 output-head dtype.
+        return logits
 
 
 class MiniMaxH3VideoBackbone(nn.Module):
@@ -604,10 +671,23 @@ class MiniMaxH3VideoBackbone(nn.Module):
     ) -> dict[str, Any]:
         """Run all aligned H3/Action layers for Scheme A."""
 
-        if qwen_embeddings.ndim != 3 or qwen_embeddings.shape[-1] != self.text_dim:
+        if qwen_embeddings.ndim != 3 or qwen_embeddings.shape[-1] not in (
+            self.text_dim,
+            self.hidden_size,
+        ):
             raise ValueError(
-                f"qwen_embeddings must be [B,L,{self.text_dim}], got "
+                f"qwen_embeddings must be [B,L,{self.text_dim}] pre-Refiner or "
+                f"[B,L,{self.hidden_size}] post-Refiner, got "
                 f"{tuple(qwen_embeddings.shape)}"
+            )
+        if qwen_embeddings.shape[-1] == self.hidden_size and any(
+            parameter.requires_grad
+            for module in (self.condition_proj, self.token_refiner)
+            for parameter in module.parameters()
+        ):
+            raise ValueError(
+                "Post-Refiner cache is invalid while condition_proj or "
+                "TokenRefiner parameters are trainable"
             )
         batch_size, max_text_length = qwen_embeddings.shape[:2]
         if qwen_tags.shape != (batch_size, max_text_length):
@@ -643,8 +723,12 @@ class MiniMaxH3VideoBackbone(nn.Module):
         refiner_cu = build_batch_cu_seqlens(
             [int(length) for length in text_lengths]
         ).to(qwen_embeddings.device)
-        refined_flat = self.refine_text_condition(flat_qwen, flat_tags, refiner_cu)
-        qwen_hidden = qwen_embeddings.new_zeros(
+        refined_flat = (
+            self.refine_text_condition(flat_qwen, flat_tags, refiner_cu)
+            if flat_qwen.shape[-1] == self.text_dim
+            else flat_qwen
+        )
+        qwen_hidden = refined_flat.new_zeros(
             (batch_size, max_text_length, self.hidden_size)
         )
         qwen_hidden[qwen_valid] = refined_flat
@@ -1017,3 +1101,62 @@ def load_h3_video_backbone(
     if missing:
         raise RuntimeError(f"Did not load all H3 visual parameters: {sorted(missing)[:10]}")
     return model.to(device=device).eval()
+
+
+def load_h3_condition_refiner(
+    transformer_dir: str | Path,
+    *,
+    device: str | torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+) -> H3ConditionRefiner:
+    """Load only the frozen context projection and TokenRefiner weights."""
+
+    transformer_dir = Path(transformer_dir)
+    config = json.loads((transformer_dir / "config.json").read_text())
+    kwargs = {
+        "text_dim": config["text_dim"],
+        "hidden_size": config["hidden_size"],
+        "token_refiner_num_layers": config.get("token_refiner_num_layers", 2),
+        "num_attention_heads": config["num_attention_heads"],
+        "attention_head_dim": config["attention_head_dim"],
+        "ffn_hidden_size": config["ffn_hidden_size"],
+        "norm_eps": config.get("norm_eps", 1e-5),
+        "qk_norm_eps": config.get("qk_norm_eps", 1e-5),
+        "final_norm_eps": config.get("final_norm_eps", 1e-5),
+    }
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        with torch.device("meta"):
+            model = H3ConditionRefiner(**kwargs)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    model.to_empty(device="cpu")
+    target_keys = set(model.state_dict())
+    index = json.loads(
+        (transformer_dir / "model.safetensors.index.json").read_text()
+    )["weight_map"]
+    jobs: dict[str, list[str]] = defaultdict(list)
+    for key in target_keys:
+        if key not in index:
+            raise KeyError(f"H3 checkpoint is missing refiner key {key!r}.")
+        jobs[index[key]].append(key)
+    loaded: set[str] = set()
+    for shard_name, keys in sorted(jobs.items()):
+        with safe_open(
+            transformer_dir / shard_name, framework="pt", device="cpu"
+        ) as handle:
+            shard = {key: handle.get_tensor(key) for key in keys}
+        incompatible = model.load_state_dict(shard, strict=False, assign=True)
+        if incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"Unexpected refiner keys in {shard_name}: "
+                f"{incompatible.unexpected_keys}"
+            )
+        loaded.update(shard)
+    missing = target_keys - loaded
+    if missing:
+        raise RuntimeError(
+            f"Did not load all H3 refiner parameters: {sorted(missing)[:10]}"
+        )
+    return model.to(device=device).requires_grad_(False).eval()

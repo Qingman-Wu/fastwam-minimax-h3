@@ -14,8 +14,10 @@ from omegaconf import DictConfig
 
 from fastwam.datasets.h3_condition_cache import (
     H3_CACHE_MANIFEST,
-    _cache_digest,
+    H3_REFINED_CACHE_MANIFEST,
+    H3_REFINED_CACHE_SCHEMA_VERSION,
     _load_cache_manifest,
+    h3_condition_cache_path,
     load_h3_condition_cache_file,
 )
 from fastwam.utils.config_resolvers import register_default_resolvers
@@ -123,7 +125,18 @@ def main(cfg: DictConfig) -> None:
         )
 
     manifest = _load_cache_manifest(cache_dir)
-    cache_files = sorted(cache_dir.glob("*.h3-qwen-prenorm-layer50-v3.pt"))
+    refined_cache = (
+        manifest["schema_version"] == H3_REFINED_CACHE_SCHEMA_VERSION
+    )
+    cache_suffix = (
+        "*.h3-post-refiner-v4.pt"
+        if refined_cache
+        else "*.h3-qwen-prenorm-layer50-v3.pt"
+    )
+    manifest_name = (
+        H3_REFINED_CACHE_MANIFEST if refined_cache else H3_CACHE_MANIFEST
+    )
+    cache_files = sorted(cache_dir.glob(cache_suffix))
     scanned_cache_files = (
         cache_files
         if max_cache_files is None
@@ -191,13 +204,12 @@ def main(cfg: DictConfig) -> None:
                 sample = strict_getter(sample_index)
                 row_count = int(sample["prompt_embeds"].shape[0])
                 local_reference_histogram[row_count] += 1
-                digest = _cache_digest(
-                    sample["video"][:, 0],
-                    sample["prompt"],
-                    manifest,
-                )
                 local_referenced_files.add(
-                    f"{digest}.h3-qwen-prenorm-layer50-v3.pt"
+                    h3_condition_cache_path(
+                        cache_dir,
+                        sample["video"][:, 0],
+                        sample["prompt"],
+                    ).name
                 )
                 local_sample_count += 1
             except FileNotFoundError as error:
@@ -337,7 +349,7 @@ def main(cfg: DictConfig) -> None:
         **gates,
         "world_size": world_size,
         "cache_dir": str(cache_dir.resolve()),
-        "manifest_path": str((cache_dir / H3_CACHE_MANIFEST).resolve()),
+        "manifest_path": str((cache_dir / manifest_name).resolve()),
         "manifest": manifest,
         "unique_cache_file_count": len(cache_files),
         "audited_unique_cache_file_count": len(scanned_cache_files),

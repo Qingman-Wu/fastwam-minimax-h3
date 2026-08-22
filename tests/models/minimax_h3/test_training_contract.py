@@ -22,6 +22,16 @@ class TinyVAE(nn.Module):
         latent[:, :, 0] = self.first_latent_value
         return latent
 
+    def encode_video_posterior(self, video, device=None):
+        latent = self.encode_video(video, device=device, process_image=False).float()
+        return latent, torch.full_like(latent, -100.0)
+
+    def encode_keyframe_condition(self, image, device=None, seed=42):
+        del seed
+        return self.encode_video(
+            image.unsqueeze(2), device=device, process_image=True
+        ).float()
+
 
 class TinyActionExpert(nn.Module):
     action_dim = 3
@@ -61,11 +71,11 @@ class TinyJointVideoExpert(nn.Module):
         return output
 
 
-def make_model(first_latent_value=1.0):
+def make_model(first_latent_value=1.0, *, vae=True):
     return FastWAMH3(
         video_expert=TinyJointVideoExpert(),
         action_expert=TinyActionExpert(),
-        vae=TinyVAE(first_latent_value),
+        vae=TinyVAE(first_latent_value) if vae else None,
         text_conditioner=None,
         device="cpu",
         torch_dtype=torch.float32,
@@ -123,6 +133,23 @@ def test_training_encodes_full_video_once_and_keyframe_separately():
     assert inputs["clean_keyframe_latents"].data_ptr() != inputs[
         "noisy_video_latents"
     ].data_ptr()
+
+
+def test_training_can_skip_vae_when_static_latents_are_cached():
+    model = make_model(vae=False)
+    sample = make_sample()
+    sample.update(
+        {
+            "video_posterior_mean": torch.full((1, 2, 2, 2, 2), 2.0),
+            "video_posterior_logvar": torch.full((1, 2, 2, 2, 2), -100.0),
+            "clean_keyframe_latents": torch.full((1, 2, 1, 2, 2), 3.0),
+        }
+    )
+
+    loss, metrics = deterministic_training_loss(model, sample)
+
+    assert torch.isfinite(loss)
+    assert metrics["loss_video"] > 0
 
 
 def test_training_diagnostics_return_tensor_losses_and_h3_snapshots():
@@ -207,6 +234,8 @@ def test_shared_progress_produces_separate_video_and_action_sigmas():
 
     _, metrics = deterministic_training_loss(model, make_sample())
 
+    assert model.video_expert.last_inputs["video_timestep"].dtype == torch.float32
+    assert model.video_expert.last_inputs["action_timestep"].dtype == torch.float32
     assert metrics["base_progress_mean"] == 0.5
     assert metrics["sigma_video_mean"] != metrics["sigma_action_mean"]
     assert metrics["sigma_video_mean"] > metrics["sigma_action_mean"]

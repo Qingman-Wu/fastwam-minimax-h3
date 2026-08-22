@@ -48,7 +48,7 @@ class FastWAMH3(nn.Module):
         *,
         video_expert: MiniMaxH3VideoBackbone,
         action_expert: H3ActionDiT,
-        vae: MiniMaxH3VAEAdapter,
+        vae: MiniMaxH3VAEAdapter | None,
         text_conditioner: MiniMaxH3TextConditioner | None,
         device: str | torch.device,
         torch_dtype: torch.dtype,
@@ -120,7 +120,8 @@ class FastWAMH3(nn.Module):
             shift=action_infer_shift,
         )
 
-        self.vae.requires_grad_(False).eval()
+        if self.vae is not None:
+            self.vae.requires_grad_(False).eval()
         if self.text_conditioner is not None:
             self.text_conditioner.requires_grad_(False).eval()
         self.video_expert.requires_grad_(not self.freeze_video_expert)
@@ -140,6 +141,7 @@ class FastWAMH3(nn.Module):
         action_dit_pretrained_path: str | Path | None,
         skip_dit_load_from_pretrain: bool,
         load_text_encoder: bool,
+        load_vae: bool,
         text_encoder_device: str | torch.device,
         device: str | torch.device,
         torch_dtype: torch.dtype,
@@ -181,8 +183,12 @@ class FastWAMH3(nn.Module):
             device=device,
             dtype=torch_dtype,
         )
-        vae = MiniMaxH3VAEAdapter(
-            model_path / "video_vae", device=device, dtype=torch_dtype
+        vae = (
+            MiniMaxH3VAEAdapter(
+                model_path / "video_vae", device=device, dtype=torch_dtype
+            )
+            if load_vae
+            else None
         )
         text_conditioner = (
             MiniMaxH3TextConditioner.from_pretrained(
@@ -294,7 +300,9 @@ class FastWAMH3(nn.Module):
         for image in images:
             array = (
                 ((image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5)
-                .byte()
+                .round()
+                .clamp(0, 255)
+                .to(torch.uint8)
                 .permute(1, 2, 0)
                 .numpy()
             )
@@ -341,10 +349,14 @@ class FastWAMH3(nn.Module):
         if embeddings is not None:
             if embeddings.ndim == 2:
                 embeddings = embeddings.unsqueeze(0)
-            if embeddings.ndim != 3 or embeddings.shape[-1] != 5120:
+            hidden_size = getattr(self.video_expert, "hidden_size", None)
+            accepted_widths = (
+                (5120, int(hidden_size)) if hidden_size is not None else (5120,)
+            )
+            if embeddings.ndim != 3 or embeddings.shape[-1] not in accepted_widths:
                 raise ValueError(
-                    "Precomputed H3 Qwen embeddings must be [B,L,5120]; "
-                    "legacy Wan/T5 context width is not accepted"
+                    "Precomputed H3 conditions must be [B,L,5120] pre-Refiner "
+                    f"or use the video expert's post-Refiner width {hidden_size}"
                 )
             tags = sample.get("prompt_token_tags")
             valid = sample.get("prompt_attention_mask")
@@ -439,7 +451,7 @@ class FastWAMH3(nn.Module):
     ):
         del tiled
         video = sample["video"].to(
-            device=self.device, dtype=self.torch_dtype, non_blocking=True
+            device=self.device, dtype=torch.float32, non_blocking=True
         )
         action = sample["action"].to(
             device=self.device, dtype=self.torch_dtype, non_blocking=True
@@ -468,15 +480,47 @@ class FastWAMH3(nn.Module):
         )
         state = self._prepare_state(sample, batch_size)
 
+        cached_video_mean = sample.get("video_posterior_mean")
+        cached_video_logvar = sample.get("video_posterior_logvar")
+        if (cached_video_mean is None) != (cached_video_logvar is None):
+            raise ValueError(
+                "video_posterior_mean and video_posterior_logvar must be cached together"
+            )
         with torch.no_grad():
-            clean_video = self.vae.encode_video(
-                video, device=self.device, process_image=False
+            if cached_video_mean is None:
+                if self.vae is None:
+                    raise ValueError(
+                        "load_vae=false requires cached video posterior moments"
+                    )
+                video_mean, video_logvar = self.vae.encode_video_posterior(
+                    video, device=self.device
+                )
+            else:
+                video_mean = cached_video_mean.to(
+                    device=self.device, dtype=torch.float32, non_blocking=True
+                )
+                video_logvar = cached_video_logvar.to(
+                    device=self.device, dtype=torch.float32, non_blocking=True
+                )
+            posterior_noise = torch.randn_like(video_mean)
+            clean_video = (
+                video_mean + torch.exp(0.5 * video_logvar) * posterior_noise
             ).to(dtype=self.torch_dtype)
-            clean_keyframe = self.vae.encode_video(
-                first_frame.unsqueeze(2),
-                device=self.device,
-                process_image=True,
-            ).to(dtype=self.torch_dtype)
+
+            cached_keyframe = sample.get("clean_keyframe_latents")
+            if cached_keyframe is None:
+                if self.vae is None:
+                    raise ValueError(
+                        "load_vae=false requires cached clean_keyframe_latents"
+                    )
+                clean_keyframe = self.vae.encode_keyframe_condition(
+                    first_frame, device=self.device, seed=42
+                )
+            else:
+                clean_keyframe = cached_keyframe.to(
+                    device=self.device, dtype=torch.float32, non_blocking=True
+                )
+            clean_keyframe = clean_keyframe.to(dtype=self.torch_dtype)
 
         if base_progress is None:
             base_progress = torch.rand(
@@ -487,12 +531,19 @@ class FastWAMH3(nn.Module):
             if base_progress.shape != (batch_size,):
                 raise ValueError(f"base_progress must be [{batch_size}]")
         video_timestep = self.train_video_scheduler.timestep_from_progress(
-            base_progress, dtype=self.torch_dtype
+            base_progress, dtype=torch.float32
         )
         action_timestep = self.train_action_scheduler.timestep_from_progress(
-            base_progress, dtype=self.torch_dtype
+            base_progress, dtype=torch.float32
         )
 
+        # Match H3 request RNG ordering: condition augmentation is drawn before
+        # generated video noise. Action noise is Scheme-A-specific and follows.
+        keyframe_noise = (
+            torch.randn_like(clean_keyframe)
+            if keyframe_noise is None
+            else keyframe_noise.to(device=self.device, dtype=self.torch_dtype)
+        )
         video_noise = (
             torch.randn_like(clean_video)
             if video_noise is None
@@ -502,11 +553,6 @@ class FastWAMH3(nn.Module):
             torch.randn_like(action)
             if action_noise is None
             else action_noise.to(device=self.device, dtype=self.torch_dtype)
-        )
-        keyframe_noise = (
-            torch.randn_like(clean_keyframe)
-            if keyframe_noise is None
-            else keyframe_noise.to(device=self.device, dtype=self.torch_dtype)
         )
         if video_noise.shape != clean_video.shape:
             raise ValueError("video_noise must match the complete video latent shape")
@@ -653,7 +699,9 @@ class FastWAMH3(nn.Module):
         for index in range(decoded.shape[1]):
             array = (
                 ((decoded[:, index] + 1) * 127.5)
-                .byte()
+                .round()
+                .clamp(0, 255)
+                .to(torch.uint8)
                 .permute(1, 2, 0)
                 .numpy()
             )
@@ -698,6 +746,8 @@ class FastWAMH3(nn.Module):
                 "Five-frame H3 latent rollout is supported, but the released "
                 "VAE cannot faithfully decode its two retained prefix latents."
             )
+        if self.vae is None:
+            raise ValueError("H3 inference requires load_vae=true")
         if action is not None:
             raise ValueError(
                 "FastWAM-H3 inference does not accept ground-truth action conditioning"
@@ -727,7 +777,7 @@ class FastWAMH3(nn.Module):
                 "H3 num_inference_steps counts sigma points and must be at least 2"
             )
 
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        input_image = input_image.to(device=self.device, dtype=torch.float32)
         if proprio.ndim == 1:
             proprio = proprio.view(1, 1, -1)
         elif proprio.ndim == 2:
@@ -763,11 +813,19 @@ class FastWAMH3(nn.Module):
             infer_sample, input_image
         )
         state = self._prepare_state(infer_sample, batch_size)
-        clean_keyframe = self.vae.encode_video(
-            input_image.unsqueeze(2),
-            device=self.device,
-            process_image=True,
-        ).to(dtype=self.torch_dtype)
+        keyframe_encoder = getattr(self.vae, "encode_keyframe_condition", None)
+        if callable(keyframe_encoder):
+            clean_keyframe = keyframe_encoder(
+                input_image, device=self.device, seed=42
+            )
+        else:
+            # Lightweight test adapters retain the legacy image-encode API.
+            clean_keyframe = self.vae.encode_video(
+                input_image.unsqueeze(2),
+                device=self.device,
+                process_image=True,
+            )
+        clean_keyframe = clean_keyframe.to(dtype=self.torch_dtype)
 
         latent_t = MiniMaxH3VAEAdapter.latent_temporal_length(num_frames)
         latent_h = height // int(self.vae.upsampling_factor)
@@ -807,11 +865,11 @@ class FastWAMH3(nn.Module):
                 value = supplied
             return value.to(device=self.device, dtype=self.torch_dtype)
 
-        latents_video = prepare_noise(video_noise, video_shape, "video_noise")
-        latents_action = prepare_noise(action_noise, action_shape, "action_noise")
         keyframe_noise = prepare_noise(
             keyframe_noise, tuple(clean_keyframe.shape), "keyframe_noise"
         )
+        latents_video = prepare_noise(video_noise, video_shape, "video_noise")
+        latents_action = prepare_noise(action_noise, action_shape, "action_noise")
         keyframe_condition = augment_keyframe_latents(
             clean_keyframe,
             keyframe_noise,
@@ -871,8 +929,14 @@ class FastWAMH3(nn.Module):
                 ),
                 detach_h3_for_action=self.stop_action_gradient_to_h3,
             )
-            latents_video = self.infer_video_scheduler.step(
-                predictions["video_prediction"], video_delta, latents_video
+            latents_video = self.infer_video_scheduler.step_h3_video(
+                predictions["video_prediction"],
+                video_t,
+                video_delta,
+                latents_video,
+                timestep_scale=float(
+                    self.infer_video_scheduler.num_train_timesteps
+                ),
             )
             latents_action = self.infer_action_scheduler.step(
                 predictions["action_prediction"], action_delta, latents_action

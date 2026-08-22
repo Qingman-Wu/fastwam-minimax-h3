@@ -84,6 +84,19 @@ def _reduce_accumulated_metrics(
     }
 
 
+def _validate_evaluation_vae_contract(model, val_dataset, eval_every: int) -> None:
+    if (
+        int(eval_every) > 0
+        and val_dataset is not None
+        and hasattr(model, "vae")
+        and model.vae is None
+    ):
+        raise ValueError(
+            "Periodic evaluation requires a loaded VAE. Set eval_every=0 "
+            "for cache-only H3 training with load_vae=false, or load the VAE."
+        )
+
+
 class Wan22Trainer:
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
@@ -114,6 +127,7 @@ class Wan22Trainer:
             raise ValueError("max_checkpoints must be non-negative")
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        _validate_evaluation_vae_contract(model, val_dataset, self.eval_every)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
