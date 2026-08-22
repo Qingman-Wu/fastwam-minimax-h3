@@ -121,6 +121,22 @@ def deterministic_training_loss(model, sample):
     )
 
 
+def test_cache_only_h3_train_mode_allows_absent_frozen_encoders():
+    model = FastWAMH3.__new__(FastWAMH3)
+    nn.Module.__init__(model)
+    model.vae = None
+    model.text_conditioner = None
+    model.freeze_video_expert = False
+    model.video_expert = nn.Linear(2, 2)
+    model.action_expert = nn.Linear(2, 2)
+
+    returned = model.train()
+
+    assert returned is model
+    assert model.video_expert.training
+    assert model.action_expert.training
+
+
 def test_training_encodes_full_video_once_and_keyframe_separately():
     model = make_model()
 

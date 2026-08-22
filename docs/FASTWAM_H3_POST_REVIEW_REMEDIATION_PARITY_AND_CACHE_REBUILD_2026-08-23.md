@@ -763,3 +763,51 @@ corrected cache complete
 + review commit approved
 ```
 
+## 20. 2026-08-23 单样本 cache-only 全流程 smoke
+
+按用户要求，8 卡 post-Refiner 全量重建已暂停；该任务可依靠 strict-skip
+恢复。随后对 dataset index 0 生成一个独立 VAE cache：
+
+```text
+artifacts/h3_one_sample_vae_cache
+written=1
+skipped=0
+exit_code=0
+```
+
+训练读取 corrected schema-4 post-Refiner condition cache，并读取上述 VAE
+cache；`load_text_encoder=false`、`load_vae=false`，因此训练设备上没有加载
+Qwen 或 VAE。新增可复现入口：
+
+```text
+scripts/smoke_h3_one_sample_cache_training.py
+```
+
+第一次正式 ZeRO-2 启动暴露出 cache-only 生命周期 bug：
+`FastWAMH3.train()` 在 `self.vae is None` 时仍无条件执行
+`self.vae.eval()`。现已改为仅在 VAE 已加载时设置 eval mode，并增加
+`test_cache_only_h3_train_mode_allows_absent_frozen_encoders` 回归测试。
+相关 focused tests 结果为 `15 passed`。
+
+最终使用 8 卡 Accelerate ZeRO-2 对同一个 cached sample 完成一个真实
+optimizer step，结果：
+
+```text
+condition_shape=[140, 5376]
+keyframe_shape=[24, 1, 14, 28]
+posterior_shape=[24, 2, 14, 28]
+loss=1.7608
+loss_action=1.4818
+loss_video=0.2791
+peak_allocated=76.47 GiB/GPU
+peak_reserved=81.56 GiB/GPU
+H3_ONE_SAMPLE_CACHE_TRAINING_SMOKE=PASS
+exit_code=0
+```
+
+该 gate 已覆盖 strict cache load、posterior sampling、joint video/action
+forward、loss、backward、ZeRO-2 gradient synchronization、gradient
+clipping、optimizer step 和 scheduler step。它证明单样本 cache-only
+训练链路可执行，但不替代“两个不同真实样本、每 rank B=2”的最终 memory
+gate，也不替代 corrected schema-4 全量 strict audit。
+

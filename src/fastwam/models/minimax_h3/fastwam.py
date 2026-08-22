@@ -265,7 +265,8 @@ class FastWAMH3(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.vae.eval()
+        if self.vae is not None:
+            self.vae.eval()
         if self.text_conditioner is not None:
             self.text_conditioner.eval()
         if self.freeze_video_expert:
